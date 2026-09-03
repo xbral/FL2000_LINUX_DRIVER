@@ -57,6 +57,14 @@ MODULE_PARM_DESC(probe_only,
 		 "stays at zero and rmmod/insmod can be iterated freely. Intended for poking the "
 		 "chip's I2C master with i2c-tools while debugging DDC");
 
+int fl2000_force_bpp;
+module_param_named(force_bpp, fl2000_force_bpp, int, 0644);
+MODULE_PARM_DESC(force_bpp,
+		 "Force bytes per pixel for every mode: 0 = auto (default), 2 = RGB565, 3 = RGB888. "
+		 "Writable at runtime via /sys/module/fl2000/parameters; takes effect on the next "
+		 "modeset. Auto uses RGB565 when the pixel clock would drain more USB bandwidth than "
+		 "the bus sustains (e.g. 1920x1080@60 on USB 3.0)");
+
 static struct usb_device_id fl2000_id_table[] = {
 	{ USB_DEVICE_INTERFACE_CLASS(USB_VENDOR_FRESCO_LOGIC, USB_PRODUCT_FL2000, USB_CLASS_AV) },
 	{},

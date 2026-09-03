@@ -739,6 +739,126 @@ Unrelated to the driver: the replug into the other port never enumerated at
 USB level ("Device not responding to setup address", error -71) — dongle
 needs a working USB-3 port; nothing arrived for the driver to probe.
 
+## 1080p shimmer — bandwidth-starved RGB888 (fixed with RGB565 fallback)
+
+Symptom: at 1920x1080@60 the VGA monitor shows a steady tremble/shimmer; lower
+modes (1600x900, 1280x720, 1024x768) are rock solid.
+
+Mechanism: the driver picked bytes/pixel from a bandwidth table whose
+SuperSpeed entry was `5000000000 * 100 / 80 / 8` = 781 MB/s — the 100/80 is
+inverted (comment says 80% budget, arithmetic gives 125%). Every mode under
+~260 MHz therefore got RGB888. At 1080p60 that drains 445 MB/s from the chip's
+line buffer while real-world xHCI bulk fills at ~350-400 MB/s; the LBUF runs
+permanently at its floor and the DAC timing gets perturbed — the tremble. The
+FL2000DX was designed for 16-bit colour at 1080p (drain 297 MB/s), which is
+what Windows uses.
+
+Fix in fl2000_drm.c:
+
+- `fl2000_get_bytes_pix()` now picks RGB888 only when `3 * pixclock` fits the
+  per-speed budget, falls back to RGB565 when `2 * pixclock` fits, and rejects
+  the mode otherwise. Budgets: 350 MB/s for SuperSpeed (realistic bulk
+  ceiling), HS/SuperSpeed+ keep their old effective values so USB 2.0 mode
+  filtering does not regress.
+- New runtime param `force_bpp` (`/sys/module/fl2000/parameters/force_bpp`):
+  0 = auto (default), 2 = RGB565 everywhere, 3 = RGB888 everywhere. Applies on
+  the next modeset. Useful to A/B the shimmer against pixel format without
+  rebuilding.
+- `fl2000_output_mode_set()` logs the chosen format
+  (`Pixel format: 2 bytes/pixel (RGB565)`).
+
+Consequence: 1920x1080@60 (148.3 MHz) and 1680x1050/1920x1200 fall back to
+RGB565; everything up to 1600x900/1280x1024 stays RGB888. Expect visible
+gradient banding on the VGA monitor only at the modes that changed.
+
+Build note: the Makefile used `M=$(PWD)`, which breaks any build invoked as
+`make -C fl2000_driver` from another directory (the kernel kbuild then looks
+for a Makefile in the wrong objdir). Switched to `M=$(CURDIR)`; also dropped
+the `CHECK=/usr/bin/sparse` hook (sparse is not installed here). DKMS build
+and install: `install.sh` at the repo root (creates fl2000_drm/1.0.2).
+
+## 1080p still flashing — the RGB565 fallback above never fired (units bug)
+
+Symptom: after the previous fix, 1920x1080@60 still showed bright flashes,
+strongest at the bottom of the screen.
+
+Cause found in `fl2000_get_bytes_pix()`: the bandwidth test compared
+`(u64)pixclock * 3 <= max_bw` with `pixclock` in **kHz** (DRM convention,
+148500 for 1080p60) against `max_bw` in **bytes/second** (350 000 000).
+`148500 * 3 = 445 500 <= 350 000 000` is true for every mode the PLL filter
+allows, so the function always returned 3 (RGB888) and the RGB565 fallback
+never triggered — the dongle kept draining 445 MB/s from a ~350 MB/s bus, the
+line buffer bottomed out during each frame, and the DAC flashed where the
+buffer hit the floor (bottom of screen, frame end). The top of the frame is
+immune because the buffer is fullest right after the frame boundary.
+
+Fix: compare in consistent units — `(u64)pixclock * 3000` (RGB888) and
+`(u64)pixclock * 2000` (RGB565) against the bytes/second budget. At SuperSpeed
+1080p60 (148.5 MHz) now selects RGB565 (297 MB/s drain) as originally
+intended; 1600x900/1280x1024@60 stay RGB888; 1680x1050/1920x1200 fall to
+RGB565; modes whose RGB565 drain still exceeds 350 MB/s are now filtered out
+of the mode list. USB 2.0 High Speed and SuperSpeed+ return RGB888
+unconditionally (old behaviour: no honest HS budget allows any real mode, and
+10 Gbps covers RGB888 at the pixel clock ceiling).
+
+Verification after reload: `sudo dmesg | grep "Pixel format"` must show
+`2 bytes/pixel (RGB565)` at 1920x1080. `force_bpp` still overrides everything
+for A/B tests.
+
+## 1080p missing from the mode list after reboot — dead htotal-adjustment loop
+
+Symptom: after a reboot the VGA monitor no longer offered 1920x1080; the
+kernel mode list topped out at 1680x1050 and GNOME fell back to 1280x720.
+
+Cause: the monitor's EDID (`LG FULL HD`, one detailed timing) advertises
+1920x1080@60 at exactly 148.5 MHz. The driver's `mode_valid` runs every mode
+through the PLL synthesis check (500 ppm budget), and 148.5 MHz cannot be
+synthesised with the 1 GHz VCO cap (best: 890/6 = 148.333 MHz, 1121 ppm).
+The documented ±10 htotal-adjustment search was supposed to fix exactly this,
+but the loop variable was dead: `for (int m = 0, s = 0, ...)` — `s` starts at
+0, `-0 == 0`, so `d` never left 0 and only the raw pixel clock was ever
+checked. Same bug as upstream. The rejected DTD made the mode list lose
+1080p (and 1440x900/1400x1050/1280x800, whose clocks also fail unadjusted).
+
+Fix: `s = 1` so `d` follows the intended sequence 0, -1, 1, -2, 2, ... .
+1920x1080 now validates with htotal 2198 at 148.333 MHz (213 ppm) — the
+adjusted timing is what `fl2000_output_mode_set()` programs, and analog VGA
+tolerates the 0.1% htotal change. 1440x900/1400x1050/1280x800 come back too.
+
+Verification after reinstall (`install.sh`, then unplug/replug or reboot):
+`xrandr` lists 1920x1080 for VGA-1 and dmesg shows
+`Mode configured: "1920x1080"` with clock 148333 and
+`2 bytes/pixel (RGB565)`.
+
+## 1080p still missing after reboot #2 — no-EDID fallback list never had it
+
+Symptom: after a cold reboot VGA-1 again topped out at 1680x1050, even with the
+fixed module loaded (srcversion of `/lib/modules/.../updates/dkms/fl2000.ko`
+matched the local build). The earlier verification had been done in a session
+where the EDID *was* read (`LG FULL HD` detailed timing → 1080p came from the
+DTD); on this boot `card1-VGA-1/edid` was 0 bytes.
+
+Cause: with no EDID the driver relies on `drm_add_modes_noedid(1920, 1200)`,
+and the resulting list (10 modes: 640x480 … 1680x1050) simply does not carry
+1920x1080@60. Hand-checking the PLL math confirmed the fixed `mode_valid`
+would accept it (d = -2 → htotal 2198, 890/6 = 148.333 MHz, ~213 ppm; RGB565
+drain 297 MB/s ≤ 350 MB/s budget) — the mode is rejected by absence, not
+validation. Whether the fallback table carries 1080p varies by kernel version;
+this dongle's DDC also reads nothing on many cold boots (documented above),
+so EDID-dependent availability made 1080p disappear "at random".
+
+Fix in fl2000_drm.c:
+
+- `fl2000_connector_get_modes()` now injects an explicit CEA-861
+  1920x1080@60 (148.5 MHz, htotal 2200) into the no-EDID mode list when the
+  fallback table did not provide one. `mode_valid` still filters it.
+- `fl2000_display_mode_valid()` logs rejections via `dev_dbg()`:
+  `no PLL setting within tolerance` / `pixel drain exceeds USB bandwidth
+  budget`. Enable with dyndbg to see exactly why a mode drops out.
+
+Verification after reload: `xrandr` must list 1920x1080 under VGA-1 even with
+`cat /sys/class/drm/card1-VGA-1/edid | wc -c` == 0.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited

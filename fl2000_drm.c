@@ -42,48 +42,59 @@ static const u32 fl2000_pixel_formats[] = {
 /* Maximum acceptable ppm error */
 #define FL2000_PPM_ERR_MAX 500
 
-/* Assume bulk transfers can use only 80% of USB bandwidth */
-#define FL2000_BULK_BW_PERCENT 80
-
-#define FL2000_BULK_BW_HIGH_SPEED	(480000000ull * 100 / FL2000_BULK_BW_PERCENT / 8)
-#define FL2000_BULK_BW_SUPER_SPEED	(5000000000ull * 100 / FL2000_BULK_BW_PERCENT / 8)
-#define FL2000_BULK_BW_SUPER_SPEED_PLUS (10000000000ull * 100 / FL2000_BULK_BW_PERCENT / 8)
+/* Sustainable bulk bandwidth per USB speed, bytes per second. The chip's VGA line buffer
+ * drains at bytes_per_pixel * pixclock, and when USB cannot refill it at that rate the DAC
+ * output timing becomes irregular - visible as shimmer/tremor at high resolutions. So pick
+ * the per-mode bytes/pixel against a budget the bus can actually sustain.
+ *
+ * SuperSpeed: the nominal payload rate is 500 MB/s (5 Gbps after 8b/10b), but real-world
+ * xHCI bulk transfers top out around 350-400 MB/s. 1920x1080@60 in RGB888 drains 445 MB/s,
+ * above the fill rate; the FL2000DX was designed for 16-bit colour at 1080p, where the drain
+ * is a comfortable 297 MB/s. The 350 MB/s budget therefore selects RGB565 exactly for the
+ * modes that need it and RGB888 below.
+ *
+ * USB 2.0 High Speed and SuperSpeed+ are handled in fl2000_get_bytes_pix() directly: no
+ * honest HS budget allows any real mode (so all modes stay allowed with RGB888 as before),
+ * and the 10 Gbps SS+ budget covers RGB888 even at the pixel clock ceiling.
+ */
+#define FL2000_BULK_BW_SUPER_SPEED	 350000000ull
 
 static unsigned int fl2000_get_bytes_pix(enum usb_device_speed speed, unsigned int pixclock)
 {
-	unsigned int bytes_pix;
 	unsigned int max_bw;
 
-	/* Calculate maximum bandwidth, bytes per second */
+	/* Diagnostics/testing override: force a pixel format on every mode */
+	if (fl2000_force_bpp == 2 || fl2000_force_bpp == 3)
+		return fl2000_force_bpp;
+
 	switch (speed) {
 	case USB_SPEED_HIGH:
-		max_bw = FL2000_BULK_BW_HIGH_SPEED;
-		break;
+		/* USB 2.0 cannot honestly sustain the drain of any real mode; the chip stalls
+		 * its DAC gracefully when starved, and historically every mode was offered
+		 * with RGB888. Keep that so USB 2.0 mode filtering does not regress.
+		 */
+		return 3;
 	case USB_SPEED_SUPER:
 		max_bw = FL2000_BULK_BW_SUPER_SPEED;
 		break;
 	case USB_SPEED_SUPER_PLUS:
-		max_bw = FL2000_BULK_BW_SUPER_SPEED_PLUS;
-		break;
+		/* 10 Gbps budget covers RGB888 even at the 500 MHz pixel clock ceiling */
+		return 3;
 	default:
 		return 0;
 	}
 
-	/* Maximum bytes per pixel with maximum bandwidth */
-	bytes_pix = max_bw / pixclock;
-	switch (bytes_pix) {
-	case 0: /* Not enough */
-	case 1: /* RGB 332 not supported*/
-		return 0;
-	case 2: /* RGB 565 */
-	case 3: /* RGB 888 */
-		break;
-	default:
-		bytes_pix = 3;
-		break;
-	}
+	/* pixclock arrives in kHz (DRM convention), max_bw is bytes/second, so the drain is
+	 * bytes_pix * pixclock * 1000. Prefer RGB888, fall back to RGB565, reject if even
+	 * RGB565 overruns the budget. Overflow-safe: pixclock is capped at
+	 * FL2000_MAX_PIXCLOCK (500 MHz) by the caller, so *3000 fits in u32*1000 arithmetic
+	 */
+	if ((u64)pixclock * 3000 <= max_bw)
+		return 3;
+	if ((u64)pixclock * 2000 <= max_bw)
+		return 2;
 
-	return bytes_pix;
+	return 0;
 }
 
 struct fl2000_drm_if {
@@ -139,6 +150,8 @@ static int fl2000_get_edid_block(void *data, u8 *buf, unsigned int block, size_t
 static int fl2000_connector_get_modes(struct drm_connector *connector)
 {
 	struct fl2000_drm_if *drm_if = container_of(connector, struct fl2000_drm_if, connector);
+	struct drm_display_mode *mode;
+	bool have_1080p = false;
 	int count;
 
 	/* Re-read rather than cache: a VGA sink can be swapped without us being told */
@@ -156,6 +169,33 @@ static int fl2000_connector_get_modes(struct drm_connector *connector)
 	 * the user can force something bigger explicitly
 	 */
 	count = drm_add_modes_noedid(connector, 1920, 1200);
+
+	/* The kernel's fallback tables do not reliably carry 1920x1080@60 - the one detailed
+	 * timing most FHD monitors ship with. This dongle's DDC path often reads nothing on a
+	 * cold boot, so without this the native resolution would vanish after every reboot.
+	 * mode_valid still filters it through the PLL/bandwidth checks
+	 */
+	list_for_each_entry(mode, &connector->modes, head) {
+		if (!strcmp(mode->name, "1920x1080")) {
+			have_1080p = true;
+			break;
+		}
+	}
+
+	if (!have_1080p) {
+		static const struct drm_display_mode fhd_60 = {
+			DRM_MODE("1920x1080", DRM_MODE_TYPE_DRIVER, 148500, 1920, 2008,
+				 2052, 2200, 0, 1080, 1084, 1089, 1125, 0,
+				 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
+		};
+
+		mode = drm_mode_duplicate(connector->dev, &fhd_60);
+		if (mode) {
+			drm_mode_probed_add(connector, mode);
+			count++;
+		}
+	}
+
 	drm_set_preferred_mode(connector, 1024, 768);
 
 	return count;
@@ -201,7 +241,7 @@ static const struct drm_connector_funcs fl2000_connector_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
-DEFINE_DRM_GEM_DMA_FOPS(fl2000_drm_driver_fops);
+DEFINE_DRM_GEM_FOPS(fl2000_drm_driver_fops);
 
 /* No .release callback: it runs after the refcount hits zero, and the old one called
  * drm_atomic_helper_shutdown() from there - which takes a fresh drm_dev_get() on the dying
@@ -215,8 +255,8 @@ static struct drm_driver fl2000_drm_driver = {
 	.ioctls = NULL,
 	.fops = &fl2000_drm_driver_fops,
 
-	DRM_GEM_DMA_DRIVER_OPS_VMAP,
-	DRM_FBDEV_DMA_DRIVER_OPS,
+	DRM_GEM_SHMEM_DRIVER_OPS,
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
 
 	.name = DRM_DRIVER_NAME,
 	.desc = DRM_DRIVER_DESC,
@@ -327,7 +367,7 @@ static int fl2000_mode_calc(const struct drm_display_mode *mode,
 	 * 0, -1, 1, -2, 2, -3, 3, -3, 4, -4, 5, -5, ...
 	 * Here, 's' is used for sign, 'm' is used for modulo, and 'd' is the adjustment value
 	 */
-	for (int m = 0, s = 0, d = 0; m <= max_h_adjustment * 2; m++, s = -s, d += m * s) {
+	for (int m = 0, s = 1, d = 0; m <= max_h_adjustment * 2; m++, s = -s, d += m * s) {
 		/* Maximum pixel clock 1GHz, or 10^9Hz. Multiply by 10^6 we get 10^15Hz. Assume
 		 * maximum htotal is 10000 pix (no way) we get 10^19 max value and using u64 which
 		 * is 1.8*10^19 no overflow can occur. Assume all this was checked before
@@ -363,11 +403,16 @@ static enum drm_mode_status fl2000_display_mode_valid(struct drm_simple_display_
 	struct usb_device *usb_dev = drm_if->usb_dev;
 
 	/* Get PLL configuration and check if mode adjustments needed */
-	if (fl2000_mode_calc(mode, &adjusted_mode, &pll))
+	if (fl2000_mode_calc(mode, &adjusted_mode, &pll)) {
+		dev_dbg(drm->dev, "%s: no PLL setting within tolerance\n", mode->name);
 		return MODE_BAD;
+	}
 
-	if (fl2000_get_bytes_pix(usb_dev->speed, adjusted_mode.clock) == 0)
+	if (fl2000_get_bytes_pix(usb_dev->speed, adjusted_mode.clock) == 0) {
+		dev_dbg(drm->dev,
+			"%s: pixel drain exceeds USB bandwidth budget\n", mode->name);
 		return MODE_BAD;
+	}
 
 	return MODE_OK;
 }
@@ -407,11 +452,11 @@ static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
 
 static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 {
-	int ret;
 	int idx;
 	struct drm_device *drm = fb->dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
-	struct drm_gem_dma_object *dma_obj = drm_fb_dma_get_gem_obj(fb, 0);
+	struct drm_gem_object *gem_obj = drm_gem_fb_get_obj(fb, 0);
+	struct iosys_map map;
 
 	UNUSED(rect);
 
@@ -420,14 +465,16 @@ static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 		return;
 	}
 
-	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
-	if (ret)
+	if (drm_gem_vmap(gem_obj, &map)) {
+		dev_err(drm->dev, "Cannot map framebuffer for CPU access!");
+		drm_dev_exit(idx);
 		return;
+	}
 
-	fl2000_stream_compress(drm_if->stream, dma_obj->vaddr, fb->height, fb->width,
+	fl2000_stream_compress(drm_if->stream, map.vaddr, fb->height, fb->width,
 			       fb->pitches[0]);
 
-	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+	drm_gem_vunmap(gem_obj, &map);
 
 	drm_dev_exit(idx);
 }
@@ -485,6 +532,8 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 
 	dev_info(drm->dev, "Mode requested:  " DRM_MODE_FMT, DRM_MODE_ARG(mode));
 	dev_info(drm->dev, "Mode configured: " DRM_MODE_FMT, DRM_MODE_ARG(adjusted_mode));
+	dev_info(drm->dev, "Pixel format: %u bytes/pixel (%s)", bytes_pix,
+		 bytes_pix == 2 ? "RGB565" : "RGB888");
 
 	/* Prepare timing configuration */
 	timings.hactive = adjusted_mode->hdisplay;

@@ -30,17 +30,16 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_framebuffer.h>
-#include <drm/drm_fbdev_dma.h>
+#include <drm/drm_fbdev_shmem.h>
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_gem_framebuffer_helper.h>
-#include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_damage_helper.h>
-#include <drm/drm_fb_dma_helper.h>
 
 #include "fl2000_registers.h"
 
@@ -197,6 +196,11 @@ extern bool fl2000_vga_mode;
 
 /* Diagnostic: stream solid white instead of framebuffer content. Defined in fl2000_drv.c */
 extern bool fl2000_test_fill;
+
+/* Force bytes-per-pixel for every mode: 0 = auto (default), 2 = RGB565, 3 = RGB888.
+ * Defined in fl2000_drv.c
+ */
+extern int fl2000_force_bpp;
 
 /* DRM device creation */
 int fl2000_drm_bind(struct device *master);
