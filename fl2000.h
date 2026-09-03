@@ -72,13 +72,13 @@ enum fl2000_interface {
 		(__mask) |= __data.__val;           \
 	})
 
-static inline int fl2000_submit_urb(struct urb *urb)
+static inline int fl2000_submit_urb(struct urb *urb, gfp_t mem_flags)
 {
 	int ret;
 	int attempts = 10;
 
 	do {
-		ret = usb_submit_urb(urb, GFP_KERNEL);
+		ret = usb_submit_urb(urb, mem_flags);
 		switch (ret) {
 		case -ENXIO:
 		case -ENOMEM:
@@ -139,9 +139,13 @@ struct fl2000_pll {
 	u32 function;
 };
 
-/* Timeout in us for I2C read/write operations */
-#define I2C_RDWR_INTERVAL (200)
-#define I2C_RDWR_TIMEOUT  (256 * 1000)
+/* Timeout in us for I2C read/write operations. Cada poll é um USB control
+ * transfer (~1 ms); 200 us de intervalo inundava o endpoint de controle e
+ * travava a máquina durante EDID (32 dwords x até 1280 polls). 1 ms / 100 ms
+ * corta o pior caso em ~5x e continua folgado p/ EEPROM (ACK em <10 ms).
+ */
+#define I2C_RDWR_INTERVAL (1000)
+#define I2C_RDWR_TIMEOUT  (100 * 1000)
 
 /* Streaming transfer task */
 struct fl2000_stream;

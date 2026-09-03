@@ -63,7 +63,7 @@ static void fl2000_intr_completion(struct urb *urb)
 	urb->start_frame = -1;
 
 	/* Restart urb */
-	ret = fl2000_submit_urb(urb);
+	ret = fl2000_submit_urb(urb, GFP_ATOMIC);
 	if (ret) {
 		dev_err(&usb_dev->dev, "URB submission failed (%d)", ret);
 		/* TODO: Signal fault to system and start shutdown of usb_dev */
@@ -122,7 +122,8 @@ struct fl2000_intr *fl2000_intr_create(struct usb_device *usb_dev, struct drm_de
 		return ERR_PTR(-ENOMEM);
 	}
 
-	intr->work_queue = create_workqueue("fl2000_interrupt");
+	intr->work_queue = alloc_ordered_workqueue("fl2000_interrupt",
+						       WQ_FREEZABLE | WQ_MEM_RECLAIM);
 	if (!intr->work_queue) {
 		dev_err(&usb_dev->dev, "Create interrupt workqueue failed");
 		devres_release(&usb_dev->dev, fl2000_intr_release, NULL, NULL);

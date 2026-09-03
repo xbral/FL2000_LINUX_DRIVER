@@ -12,6 +12,7 @@
  */
 
 #include "fl2000.h"
+#include <linux/sched.h>
 
 /* Triple buffering:
  *  - one buffer for HDMI rendering
@@ -20,6 +21,13 @@
  */
 #define FL2000_SB_MIN 3
 #define FL2000_SB_NUM (FL2000_SB_MIN + 1)
+
+/* Max bulk URBs in flight. A full 1080p frame is ~4 MB in a single URB with
+ * ~1000 SG entries; letting 3-4 of those pile up bursts 12-16 MB into the xHCI
+ * ring and stalls the whole USB controller (and the CPU mapping them).
+ * 2 keeps the chip fed (it paces at frame rate) with half the burst.
+ */
+#define FL2000_MAX_INFLIGHT 2
 
 #define FL2000_URB_TIMEOUT 100
 
@@ -180,11 +188,20 @@ static void fl2000_stream_work(struct work_struct *work)
 	struct fl2000_stream *stream = container_of(work, struct fl2000_stream, work);
 	struct usb_device *usb_dev = stream->usb_dev;
 	struct fl2000_stream_buf *cur_sb;
-	struct fl2000_stream_buf *last_sb;
+	struct fl2000_stream_buf *last_sb = NULL;
 	struct urb *data_urb;
+	bool need_copy;
+	size_t copy_size;
+
+	/* Streaming é bulk contínuo a 60fps: não compete com a UI. Roda com
+	 * nice +5 para o compositor continuar fluido sob carga (Hybris/IDE).
+	 */
+	set_user_nice(current, 5);
 
 	while (stream->enabled) {
 		unsigned long flags;
+		unsigned int inflight = 0;
+		struct fl2000_stream_buf *tmp;
 
 		ret = down_interruptible(&stream->work_sem);
 		if (ret) {
@@ -205,10 +222,32 @@ static void fl2000_stream_work(struct work_struct *work)
 
 		spin_lock_irqsave(&stream->list_lock, flags);
 
+		/* Throttle: conta URBs em voo (wait_list). Se já temos o bastante,
+		 * devolve o buffer e espera o próximo completion (que dá up no sem).
+		 * Sem isso o enable dava kick de 3 frames de 4 MB de uma vez.
+		 */
+		list_for_each_entry(tmp, &stream->wait_list, list) {
+			if (++inflight >= FL2000_MAX_INFLIGHT)
+				break;
+		}
+		if (inflight >= FL2000_MAX_INFLIGHT) {
+			spin_unlock_irqrestore(&stream->list_lock, flags);
+			continue;
+		}
+
 		/* If no buffers are available for immediate transmission - then copy latest
-		 * transmission data
+		 * transmission data. Toma posse do buffer (list_del) e faz o memcpy
+		 * SEM lock e COM irqs ligadas: o memcpy de 4 MB sob spinlock com
+		 * irqsave era a causa das travadas system-wide (ms com IRQs off).
 		 */
 		if (list_empty(&stream->transmit_list)) {
+			if (list_empty(&stream->render_list)) {
+				/* Backpressure: USB mais lento que o compositor.
+				 * Antes era BUG_ON; agora só perde esse tick.
+				 */
+				spin_unlock_irqrestore(&stream->list_lock, flags);
+				continue;
+			}
 			if (list_empty(&stream->wait_list))
 				last_sb = list_last_entry(&stream->render_list,
 							  struct fl2000_stream_buf, list);
@@ -217,13 +256,46 @@ static void fl2000_stream_work(struct work_struct *work)
 							  struct fl2000_stream_buf, list);
 			cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf,
 						  list);
-			memcpy(cur_sb->vaddr, last_sb->vaddr, stream->buf_size);
+			list_del(&cur_sb->list);
+			need_copy = true;
+			copy_size = stream->buf_size;
 		} else {
 			cur_sb = list_first_entry(&stream->transmit_list, struct fl2000_stream_buf,
 						  list);
+			list_del(&cur_sb->list);
+			need_copy = false;
+			copy_size = 0;
 		}
-		list_move_tail(&cur_sb->list, &stream->wait_list);
 		spin_unlock_irqrestore(&stream->list_lock, flags);
+
+		if (need_copy) {
+			/* Fonte continua válida: buffers só são liberados com
+			 * stream parado (disable espera este worker). No pior
+			 * caso, um completion move a fonte de lista no meio da
+			 * cópia e um frame sai com tear — benigno perto de
+			 * travar a máquina com IRQ off.
+			 */
+			if (last_sb && last_sb != cur_sb)
+				memcpy(cur_sb->vaddr, last_sb->vaddr, copy_size);
+
+			spin_lock_irqsave(&stream->list_lock, flags);
+			if (!stream->enabled) {
+				list_add_tail(&cur_sb->list, &stream->render_list);
+				spin_unlock_irqrestore(&stream->list_lock, flags);
+				return;
+			}
+			list_add_tail(&cur_sb->list, &stream->wait_list);
+			spin_unlock_irqrestore(&stream->list_lock, flags);
+		} else {
+			spin_lock_irqsave(&stream->list_lock, flags);
+			if (!stream->enabled) {
+				list_add_tail(&cur_sb->list, &stream->render_list);
+				spin_unlock_irqrestore(&stream->list_lock, flags);
+				return;
+			}
+			list_add_tail(&cur_sb->list, &stream->wait_list);
+			spin_unlock_irqrestore(&stream->list_lock, flags);
+		}
 
 		data_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!data_urb) {
@@ -243,7 +315,7 @@ static void fl2000_stream_work(struct work_struct *work)
 		data_urb->transfer_flags |= URB_ZERO_PACKET;
 
 		usb_anchor_urb(data_urb, &stream->anchor);
-		ret = fl2000_submit_urb(data_urb);
+		ret = fl2000_submit_urb(data_urb, GFP_KERNEL);
 		if (ret) {
 			dev_err(&usb_dev->dev, "Data URB error %d", ret);
 			/* Must unanchor before dropping the reference: a failed-submit URB left
@@ -285,15 +357,36 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	struct fl2000_stream_buf *cur_sb;
 	void *dst;
 	u32 dst_line_len;
+	u32 bytes_pix;
+	size_t buf_size;
 	unsigned long flags;
+	static unsigned long drop_count;
 
-	BUG_ON(list_empty(&stream->render_list));
-
+	/* Toma posse de um buffer livre e converte SEM lock e COM irqs ligadas.
+	 * Antes, os ~4 MB de conversão rodavam sob spin_lock_irqsave — ms com
+	 * IRQs desligadas a cada damage, que é exatamente a "travada" da máquina
+	 * (mouse/áudio/scheduler). Listas só precisam do lock no take/put.
+	 */
 	spin_lock_irqsave(&stream->list_lock, flags);
-
+	if (list_empty(&stream->render_list)) {
+		/* Backpressure: USB mais lento que o compositor produzindo.
+		 * Antes era BUG_ON (oops). Agora descarta o frame mais antigo:
+		 * o worker vai reenviar o último via fallback, sem crash.
+		 */
+		spin_unlock_irqrestore(&stream->list_lock, flags);
+		if ((++drop_count & 0x3f) == 1)
+			pr_debug_ratelimited("fl2000: compress drop (render empty) x%lu\n",
+					     drop_count);
+		return;
+	}
 	cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
+	list_del(&cur_sb->list);
+	bytes_pix = stream->bytes_pix;
+	buf_size = stream->buf_size;
+	spin_unlock_irqrestore(&stream->list_lock, flags);
+
 	dst = cur_sb->vaddr;
-	dst_line_len = width * stream->bytes_pix;
+	dst_line_len = width * bytes_pix;
 
 	if (fl2000_test_fill) {
 		/* Diagnostic: ignore the framebuffer and transmit solid white. The chip paces
@@ -302,10 +395,10 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 		 * screen to the framebuffer copy path, while a black screen with this set
 		 * means the chip is discarding/blanking pixel data internally
 		 */
-		memset(dst, 0xff, stream->buf_size);
+		memset(dst, 0xff, buf_size);
 	} else {
 		for (unsigned int y = 0; y < height; y++) {
-			switch (stream->bytes_pix) {
+			switch (bytes_pix) {
 			case 2:
 				fl2000_xrgb888_to_rgb565_line(dst, src, width);
 				break;
@@ -320,7 +413,8 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 		}
 	}
 
-	list_move_tail(&cur_sb->list, &stream->transmit_list);
+	spin_lock_irqsave(&stream->list_lock, flags);
+	list_add_tail(&cur_sb->list, &stream->transmit_list);
 	spin_unlock_irqrestore(&stream->list_lock, flags);
 }
 
@@ -328,6 +422,7 @@ int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_p
 {
 	int ret;
 	unsigned int size;
+	unsigned long flags;
 
 	/* Round buffer size up to multiple of 8 to meet HW expectations */
 	size = (pixels * bytes_pix + 7) & ~7U;
@@ -337,6 +432,15 @@ int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_p
 	/* If there are buffers with same size - keep them */
 	if (stream->buf_size == size)
 		return 0;
+
+	/* Mode_set só é chamado com stream parado (disable já drenou o worker
+	 * e os completions). Se ainda houver buffers em voo, não libera por
+	 * baixo deles: só loga e recria o que está em render.
+	 */
+	spin_lock_irqsave(&stream->list_lock, flags);
+	if (!list_empty(&stream->transmit_list) || !list_empty(&stream->wait_list))
+		pr_warn("fl2000: mode_set with buffers in flight, recreating render only\n");
+	spin_unlock_irqrestore(&stream->list_lock, flags);
 
 	/* Destroy wrong size buffers if they exist */
 	if (!list_empty(&stream->render_list))
@@ -357,7 +461,13 @@ int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_p
 
 int fl2000_stream_enable(struct fl2000_stream *stream)
 {
-	BUG_ON(list_empty(&stream->transmit_list));
+	/* Antes era BUG_ON(transmit vazio) — um modeset sem damage prévio
+	 * derrubava a máquina. Se não há frame novo, o worker gera via
+	 * fallback (último frame / zero). Kick reduzido: 2 URBs em voo
+	 * bastam (FL2000_MAX_INFLIGHT); 3 rajadas de 4 MB travavam o xHCI.
+	 */
+	if (list_empty(&stream->transmit_list))
+		pr_debug("fl2000: enable without queued frame, worker will duplicate\n");
 
 	/* The anchor is empty here; re-init clears any poisoned state a previous disable left
 	 * behind, which would otherwise auto-reject every URB of the new session
@@ -368,7 +478,7 @@ int fl2000_stream_enable(struct fl2000_stream *stream)
 	queue_work(stream->work_queue, &stream->work);
 
 	/* Kick transmit workqueue with minimum buffers submitted */
-	for (int i = 0; i < FL2000_SB_MIN; i++)
+	for (int i = 0; i < FL2000_MAX_INFLIGHT; i++)
 		up(&stream->work_sem);
 
 	return 0;
@@ -450,7 +560,12 @@ struct fl2000_stream *fl2000_stream_create(struct usb_device *usb_dev, struct dr
 	stream->usb_dev = usb_dev;
 	stream->crtc = crtc;
 
-	stream->work_queue = create_workqueue("fl2000_stream");
+	/* Fila ordenada, unbound e freezable: um item por vez, sem prender CPU
+	 * do compositor, e congela no suspend. create_workqueue() antigo criava
+	 * workers per-CPU com prioridade normal competindo com a UI.
+	 */
+	stream->work_queue = alloc_ordered_workqueue("fl2000_stream",
+						     WQ_FREEZABLE | WQ_MEM_RECLAIM);
 	if (!stream->work_queue) {
 		dev_err(&usb_dev->dev, "Allocate streaming workqueue failed");
 		devres_release(&usb_dev->dev, fl2000_stream_release, NULL, NULL);

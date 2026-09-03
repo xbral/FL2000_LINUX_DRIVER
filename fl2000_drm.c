@@ -142,6 +142,10 @@ static int fl2000_get_edid_block(void *data, u8 *buf, unsigned int block, size_t
 			return ret;
 
 		memcpy(&buf[i], dword.b, min_t(size_t, sizeof(dword.b), len - i));
+		/* 32 round-trips USB seguidos sem ceder a CPU travavam o
+		 * output_poll; cede a cada dword.
+		 */
+		cond_resched();
 	}
 
 	return 0;
@@ -206,9 +210,24 @@ static enum drm_connector_status fl2000_connector_detect(struct drm_connector *c
 {
 	struct fl2000_drm_if *drm_if = container_of(connector, struct fl2000_drm_if, connector);
 	u32 header;
+	int sense;
 
 	UNUSED(force);
 
+	/* Caminho quente do output_poll (10 s): sense primeiro. É 1 control
+	 * read rápido (0x805C); DDC é 1 dword com poll-loop de até 100 ms e
+	 * NAKa mesmo com monitor Windows-provado (NOTES.md Round 2-4) — fazia
+	 * o poll travar centenas de ms e era a "travadinha" periódica.
+	 */
+	sense = fl2000_connector_sense(drm_if->usb_dev);
+	if (sense == 1)
+		return connector_status_connected;
+	if (sense == 0)
+		return connector_status_disconnected;
+
+	/* Sense falhou (erro USB): último recurso é o DDC. Mantido só como
+	 * fallback porque um dia o dongle pode responder EDID.
+	 */
 	if (!fl2000_i2c_dword(drm_if->usb_dev, true, FL2000_DDC_ADDR, 0, &header))
 		return connector_status_connected;
 
@@ -218,14 +237,7 @@ static enum drm_connector_status fl2000_connector_detect(struct drm_connector *c
 	 * desktop needs a definitive 'connected' to enable the output - compositors ignore
 	 * 'unknown'. Without EDID, get_modes() serves the VESA fallback list
 	 */
-	switch (fl2000_connector_sense(drm_if->usb_dev)) {
-	case 1:
-		return connector_status_connected;
-	case 0:
-		return connector_status_disconnected;
-	default:
-		return connector_status_unknown;
-	}
+	return connector_status_unknown;
 }
 
 static const struct drm_connector_helper_funcs fl2000_connector_helper_funcs = {
