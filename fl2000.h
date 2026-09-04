@@ -82,7 +82,11 @@ static inline int fl2000_submit_urb(struct urb *urb, gfp_t mem_flags)
 		switch (ret) {
 		case -ENXIO:
 		case -ENOMEM:
-			if (attempts--) {
+			/* Retry, but never yield from interrupt context: URB completion
+			 * callbacks resubmit through here in hard IRQ, where cond_resched()
+			 * would BUG ("scheduling while atomic")
+			 */
+			if (attempts-- && !in_interrupt()) {
 				cond_resched();
 				ret = -EAGAIN;
 			}
@@ -158,6 +162,8 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 			    unsigned int width, unsigned int pitch);
 int fl2000_stream_enable(struct fl2000_stream *stream);
 void fl2000_stream_disable(struct fl2000_stream *stream);
+void fl2000_stream_set_recovery(struct fl2000_stream *stream, void *ctx,
+				int (*reprogram)(void *ctx));
 
 /* Interrupt polling task */
 struct fl2000_intr;

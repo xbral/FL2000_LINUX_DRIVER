@@ -31,6 +31,20 @@
 
 #define FL2000_URB_TIMEOUT 100
 
+/* Streaming stall watchdog. Vblanks on this device ARE stream URB completions, and the
+ * transmit worker is self-sustaining (it re-submits the last frame at chip pace even
+ * with no compositor damage). Host-side accounting guarantees that a parked worker
+ * always has at least one URB in flight, so a stall with zero driver errors means the
+ * chip or the xHCI endpoint stopped completing bulk transfers: the monitor loses sync
+ * and goes black while the connector still reports connected (observed repeatedly,
+ * silent - see NOTES.md "black screen" vblank WARNs). The watchdog detects that,
+ * logs it (the missing evidence for every previous occurrence) and attempts recovery.
+ */
+#define FL2000_STALL_TIMEOUT msecs_to_jiffies(250)
+#define FL2000_WATCHDOG_PERIOD msecs_to_jiffies(1000)
+#define FL2000_STALL_SOFT_TRIES 2
+#define FL2000_STALL_HARD_TRIES 4
+
 struct fl2000_stream_buf {
 	struct list_head list;
 	struct sg_table sgt;
@@ -54,6 +68,18 @@ struct fl2000_stream {
 	struct semaphore work_sem;
 	bool enabled;
 	struct usb_anchor anchor;
+	/* Stall watchdog state, see FL2000_STALL_* above */
+	struct delayed_work watchdog_work;
+	struct workqueue_struct *watchdog_wq;
+	unsigned long last_completion;
+	unsigned int stall_recoveries;
+	bool gave_up;
+	/* Chip reprogramming callback for hard recovery, registered by the DRM layer
+	 * which knows the current mode. Plain function pointer + ctx: the DRM device
+	 * outlives the stream (fl2000_drm_if_release destroys in that order)
+	 */
+	int (*reprogram)(void *ctx);
+	void *reprogram_ctx;
 };
 
 static void fl2000_free_sb(struct fl2000_stream_buf *sb)
@@ -158,10 +184,15 @@ static void fl2000_stream_release(struct device *dev, void *res)
 
 	if (!stream || IS_ERR(stream))
 		return;
+	cancel_delayed_work_sync(&stream->watchdog_work);
 	if (stream->work_queue) {
 		fl2000_stream_disable(stream);
 		destroy_workqueue(stream->work_queue);
 		stream->work_queue = NULL;
+	}
+	if (stream->watchdog_wq) {
+		destroy_workqueue(stream->watchdog_wq);
+		stream->watchdog_wq = NULL;
 	}
 	fl2000_stream_put_buffers(stream);
 }
@@ -186,6 +217,9 @@ static void fl2000_stream_data_completion(struct urb *urb)
 		spin_lock_irqsave(&stream->list_lock, flags);
 		list_move_tail(&cur_sb->list, &stream->render_list);
 		spin_unlock_irqrestore(&stream->list_lock, flags);
+
+		/* Any completion proves the pipeline is alive: reset the stall episode */
+		stream->last_completion = jiffies;
 
 		drm_crtc_handle_vblank(stream->crtc);
 
@@ -348,6 +382,90 @@ static void fl2000_stream_work(struct work_struct *work)
 	}
 }
 
+/* Runs on its own workqueue: the transmit worker parks inside its work function while
+ * waiting on work_sem, so an ordered queue shared with it would never get to run this
+ */
+static void fl2000_stream_watchdog(struct work_struct *work)
+{
+	struct fl2000_stream *stream =
+		container_of(work, struct fl2000_stream, watchdog_work.work);
+	unsigned int inflight = 0;
+	unsigned long flags;
+	struct fl2000_stream_buf *tmp;
+	long stalled_ms;
+
+	if (!stream->enabled)
+		return;
+
+	if (!time_after(jiffies, stream->last_completion + FL2000_STALL_TIMEOUT)) {
+		if (stream->stall_recoveries) {
+			stream->stall_recoveries = 0;
+			if (stream->gave_up) {
+				stream->gave_up = false;
+				dev_info(&stream->usb_dev->dev, "stream resumed");
+			}
+		}
+		goto rearm;
+	}
+
+	stalled_ms = jiffies_to_msecs(jiffies - stream->last_completion);
+
+	spin_lock_irqsave(&stream->list_lock, flags);
+	list_for_each_entry(tmp, &stream->wait_list, list)
+		inflight++;
+	spin_unlock_irqrestore(&stream->list_lock, flags);
+
+	if (stream->gave_up)
+		goto rearm;
+
+	stream->stall_recoveries++;
+
+	if (stream->stall_recoveries <= FL2000_STALL_SOFT_TRIES) {
+		dev_err(&stream->usb_dev->dev,
+			"stream stall: no URB completion for %ld ms (%u URBs in flight), soft recovery %u",
+			stalled_ms, inflight, stream->stall_recoveries);
+
+		/* Scuttle, never poison: poison blocks until the HCD gives every URB back,
+		 * which never happens on a wedged port and would pin this worker forever.
+		 * Scuttled URBs are dropped from the anchor without waiting; if the chip
+		 * comes back to life their completions still fire and the buffers return
+		 */
+		usb_scuttle_anchored_urbs(&stream->anchor);
+
+		/* Restart the self-sustaining transmit loop with whatever buffers are on
+		 * render_list
+		 */
+		up(&stream->work_sem);
+		up(&stream->work_sem);
+	} else if (stream->stall_recoveries <= FL2000_STALL_HARD_TRIES) {
+		int ret = -ENODEV;
+
+		dev_err(&stream->usb_dev->dev, "stream stall persists, chip reset recovery %u",
+			stream->stall_recoveries);
+
+		/* Soft recovery did not revive the bulk stream: app-reset the chip and
+		 * reprogram the current mode (control transfers, bounded by the control
+		 * timeout - cannot hang). A reset chip may resume ACKing, which also
+		 * releases the scuttled in-flight URBs and their buffers
+		 */
+		if (stream->reprogram)
+			ret = stream->reprogram(stream->reprogram_ctx);
+		if (ret)
+			dev_err(&stream->usb_dev->dev, "chip reprogramming failed (%d)", ret);
+
+		up(&stream->work_sem);
+		up(&stream->work_sem);
+	} else {
+		stream->gave_up = true;
+		dev_err(&stream->usb_dev->dev,
+			"stream stalled for %ld ms, %u recoveries failed: giving up, unplug and replug the dongle to recover the display",
+			stalled_ms, stream->stall_recoveries - 1);
+	}
+
+rearm:
+	queue_delayed_work(stream->watchdog_wq, &stream->watchdog_work, FL2000_WATCHDOG_PERIOD);
+}
+
 static void fl2000_xrgb888_to_rgb888_line(u8 *dbuf, u32 *sbuf, u32 pixels)
 {
 	unsigned int xx = 0;
@@ -381,6 +499,16 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 
 	if (!stream || IS_ERR(stream) || !src)
 		return;
+
+	/* Defensive: never walk past the allocated buffers even if a caller passes
+	 * geometry that does not match the current mode (the OOB page fault of kdump
+	 * 202609040702 came through exactly such a mismatch)
+	 */
+	if ((u64)height * width * stream->bytes_pix > stream->buf_size) {
+		pr_err_ratelimited("fl2000: compress geometry %ux%u x%u exceeds buffer %zu, dropping frame\n",
+				   width, height, stream->bytes_pix, stream->buf_size);
+		return;
+	}
 
 	/* Toma posse de um buffer livre e converte SEM lock e COM irqs ligadas.
 	 * Antes, os ~4 MB de conversão rodavam sob spin_lock_irqsave — ms com
@@ -504,11 +632,17 @@ int fl2000_stream_enable(struct fl2000_stream *stream)
 	init_usb_anchor(&stream->anchor);
 	sema_init(&stream->work_sem, 0);
 	stream->enabled = true;
+	stream->last_completion = jiffies;
+	stream->stall_recoveries = 0;
+	stream->gave_up = false;
 	queue_work(stream->work_queue, &stream->work);
 
 	/* Kick transmit workqueue with minimum buffers submitted */
 	for (int i = 0; i < FL2000_MAX_INFLIGHT; i++)
 		up(&stream->work_sem);
+
+	/* Arm the stall watchdog for the whole streaming session */
+	queue_delayed_work(stream->watchdog_wq, &stream->watchdog_work, FL2000_WATCHDOG_PERIOD);
 
 	return 0;
 }
@@ -524,6 +658,11 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 		return;
 
 	stream->enabled = false;
+
+	/* Stop the watchdog first: it must not attempt recovery against a stream that is
+	 * being torn down (its 'enabled' check races a running iteration)
+	 */
+	cancel_delayed_work_sync(&stream->watchdog_work);
 
 	/* Unblock a worker parked on the semaphore so drain can complete; the worker checks
 	 * 'enabled' on wake and exits
@@ -586,6 +725,7 @@ struct fl2000_stream *fl2000_stream_create(struct usb_device *usb_dev, struct dr
 	devres_add(&usb_dev->dev, stream);
 
 	INIT_WORK(&stream->work, &fl2000_stream_work);
+	INIT_DELAYED_WORK(&stream->watchdog_work, &fl2000_stream_watchdog);
 	INIT_LIST_HEAD(&stream->render_list);
 	INIT_LIST_HEAD(&stream->transmit_list);
 	INIT_LIST_HEAD(&stream->wait_list);
@@ -607,7 +747,29 @@ struct fl2000_stream *fl2000_stream_create(struct usb_device *usb_dev, struct dr
 		return ERR_PTR(-ENOMEM);
 	}
 
+	/* Watchdog em fila própria: o worker de transmissão estaciona dentro da
+	 * própria work function esperando o semáforo, então uma fila ordenada
+	 * compartilhada nunca rodaria o watchdog. Freezable para não "recuperar"
+	 * um stream congelado durante suspend.
+	 */
+	stream->watchdog_wq = alloc_ordered_workqueue("fl2000_stall",
+						      WQ_FREEZABLE);
+	if (!stream->watchdog_wq) {
+		dev_err(&usb_dev->dev, "Allocate stall watchdog workqueue failed");
+		devres_release(&usb_dev->dev, fl2000_stream_release, NULL, NULL);
+		return ERR_PTR(-ENOMEM);
+	}
+
 	return stream;
+}
+
+void fl2000_stream_set_recovery(struct fl2000_stream *stream, void *ctx,
+				int (*reprogram)(void *ctx))
+{
+	if (!stream || IS_ERR(stream))
+		return;
+	stream->reprogram = reprogram;
+	stream->reprogram_ctx = ctx;
 }
 
 void fl2000_stream_destroy(struct usb_device *usb_dev)

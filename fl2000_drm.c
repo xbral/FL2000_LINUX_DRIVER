@@ -107,6 +107,14 @@ struct fl2000_drm_if {
 	/* Only used when driving the integrated VGA DAC, i.e. when there is no bridge component */
 	struct drm_connector connector;
 	const struct drm_edid *drm_edid;
+
+	/* Last mode programmed into the chip, kept for the streaming stall watchdog's hard
+	 * recovery (chip app-reset + reprogram). Filled by fl2000_output_mode_set()
+	 */
+	struct fl2000_pll last_pll;
+	struct fl2000_timings last_timings;
+	unsigned int last_bytes_pix;
+	bool mode_config_valid;
 };
 
 /* Read one EDID block over the FL2000's own I2C master.
@@ -462,15 +470,22 @@ static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
 	fl2000_stream_disable(drm_if->stream);
 }
 
-static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
+/* The fb can be larger than the mode the CRTC is running (an fbdev restore commits its
+ * old 1920x1080 fb onto the 1024x768 preferred mode, and atomic check clips the plane
+ * without complaining). Compressing with the raw fb dimensions then walks past the end
+ * of the stream buffers - the OOB page fault in fl2000_stream_compress of kdump
+ * 202609040702. Clip the copy to the active mode instead.
+ */
+static void fb2000_dirty(struct drm_framebuffer *fb, unsigned int clip_width,
+			 unsigned int clip_height)
 {
 	int idx;
 	struct drm_device *drm = fb->dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
 	struct drm_gem_object *gem_obj = drm_gem_fb_get_obj(fb, 0);
 	struct iosys_map map;
-
-	UNUSED(rect);
+	unsigned int width = min(fb->width, clip_width);
+	unsigned int height = min(fb->height, clip_height);
 
 	if (!drm_dev_enter(fb->dev, &idx)) {
 		dev_err(drm->dev, "DRM enter failed!");
@@ -483,8 +498,7 @@ static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 		return;
 	}
 
-	fl2000_stream_compress(drm_if->stream, map.vaddr, fb->height, fb->width,
-			       fb->pitches[0]);
+	fl2000_stream_compress(drm_if->stream, map.vaddr, height, width, fb->pitches[0]);
 
 	drm_gem_vunmap(gem_obj, &map);
 
@@ -500,8 +514,22 @@ static void fl2000_display_update(struct drm_simple_display_pipe *pipe,
 	struct drm_plane_state *state = pipe->plane.state;
 	struct drm_rect rect;
 
-	if (drm_atomic_helper_damage_merged(old_state, state, &rect))
-		fb2000_dirty(state->fb, &rect);
+	if (drm_atomic_helper_damage_merged(old_state, state, &rect)) {
+		struct drm_crtc_state *cstate = crtc->state;
+		unsigned int clip_width = state->fb->width;
+		unsigned int clip_height = state->fb->height;
+
+		if (cstate) {
+			if (cstate->adjusted_mode.hdisplay)
+				clip_width = min_t(unsigned int, clip_width,
+						   cstate->adjusted_mode.hdisplay);
+			if (cstate->adjusted_mode.vdisplay)
+				clip_height = min_t(unsigned int, clip_height,
+						    cstate->adjusted_mode.vdisplay);
+		}
+
+		fb2000_dirty(state->fb, clip_width, clip_height);
+	}
 
 	if (event) {
 		crtc->state->event = NULL;
@@ -578,6 +606,48 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	fl2000_afe_magic(usb_dev);
 
 	fl2000_stream_mode_set(drm_if->stream, mode->hdisplay * mode->vdisplay, bytes_pix);
+
+	/* Remember the working configuration so the streaming stall watchdog can
+	 * app-reset and reprogram the chip without a full modeset (no locks taken,
+	 * so it can race a real modeset - acceptable: a stalled output is already
+	 * broken and the next modeset rewrites everything anyway)
+	 */
+	drm_if->last_pll = pll;
+	drm_if->last_timings = timings;
+	drm_if->last_bytes_pix = bytes_pix;
+	drm_if->mode_config_valid = true;
+}
+
+/* Chip reprogramming for the streaming stall watchdog's hard recovery: same register
+ * sequence as fl2000_output_mode_set(). Control transfers with a bounded timeout, so it
+ * cannot hang even against a wedged chip. Called from the watchdog's own workqueue.
+ */
+static int fl2000_stream_reprogram(void *ctx)
+{
+	struct fl2000_drm_if *drm_if = ctx;
+	struct usb_device *usb_dev = drm_if->usb_dev;
+	int ret;
+
+	if (!drm_if->mode_config_valid)
+		return -ENODEV;
+
+	dev_err(drm_if->drm.dev, "stream stall: app-reset and reprogramming chip mode");
+
+	ret = fl2000_set_pll(usb_dev, &drm_if->last_pll);
+	if (!ret)
+		ret = fl2000_reset(usb_dev);
+	if (!ret)
+		ret = fl2000_set_timings(usb_dev, &drm_if->last_timings);
+	if (!ret)
+		ret = fl2000_set_pixfmt(usb_dev, drm_if->last_bytes_pix);
+	if (!ret)
+		ret = fl2000_set_transfers(usb_dev);
+	if (!ret)
+		ret = fl2000_enable_interrupts(usb_dev);
+	if (!ret)
+		ret = fl2000_afe_magic(usb_dev);
+
+	return ret;
 }
 
 /* FL2000 HW control functions: mode configuration, turn on/off */
@@ -596,20 +666,32 @@ static void fl2000_drm_if_release(struct fl2000_drm_if *drm_if, struct device *m
 	if (!fl2000_vga_mode)
 		component_unbind_all(master, drm);
 
+	drm_kms_helper_poll_fini(drm);
+
+	/* Shutdown BEFORE tearing down the stream/interrupt contexts. The atomic shutdown
+	 * runs a disable-all commit that calls the pipe's .disable callback, i.e.
+	 * fl2000_display_disable() -> fl2000_stream_disable(drm_if->stream). The old order
+	 * destroyed the stream first (devres free) and then ran shutdown, so the pipe
+	 * callbacks dereferenced freed memory - the hot-unplug kernel panic of kdump
+	 * 202609040716 and 202609041234 (machine "reboots by itself" on unplug). The null
+	 * checks in fl2000_stream_disable() do not help against a dangling pointer, only
+	 * ordering does
+	 */
+	drm_atomic_helper_shutdown(drm);
+
+	/* From here on drm_dev_enter() fails, so no new commit or fbdev client restore can
+	 * reach the stream (this also closes the use-after-free of kdump 202609040702,
+	 * where a last-fd-close fbdev restore committed into a torn-down stream)
+	 */
+	drm_dev_unplug(drm);
+
 	/* Stop streaming interface */
 	fl2000_stream_destroy(usb_dev);
+	drm_if->stream = NULL;
 
 	/* Stop interrupts interface */
 	fl2000_intr_destroy(usb_dev);
-
-	/* Prepare to DRM device shutdown. The atomic shutdown must run HERE, while the device
-	 * is still alive - not from the .release callback where the refcount is already zero.
-	 * The pipe callbacks fail fast against an already-removed USB device, so this is safe
-	 * on hot-unplug too
-	 */
-	drm_kms_helper_poll_fini(drm);
-	drm_atomic_helper_shutdown(drm);
-	drm_dev_unplug(drm);
+	drm_if->intr = NULL;
 
 	drm_edid_free(drm_if->drm_edid);
 	drm_if->drm_edid = NULL;
@@ -705,6 +787,9 @@ int fl2000_drm_bind(struct device *master)
 		dev_set_drvdata(master, NULL);
 		return ret;
 	}
+
+	/* Let the streaming stall watchdog reprogram the chip when bulk transfers wedge */
+	fl2000_stream_set_recovery(drm_if->stream, drm_if, fl2000_stream_reprogram);
 
 	/* Start interrupts interface */
 	drm_if->intr = fl2000_intr_create(usb_dev, drm);

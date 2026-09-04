@@ -869,3 +869,161 @@ Verification after reload: `xrandr` must list 1920x1080 under VGA-1 even with
       echo 'module fl2000 +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 - `fl2000.ko` depends on `drm_dma_helper`; `modprobe drm_dma_helper` first when
   using `insmod`.
+
+## Session log — 2026-09-04 (session 4): crash triage via kdump, unplug-panic fix, OOB fix, stall watchdog
+
+Machine had hard-reset during the previous session; this session reconstructed
+events from the journal and the kdump vmcores before touching code.
+
+### Incident reconstruction (journal + /var/crash)
+
+Three kernel crashes the same day, all in fl2000. Boots:
+
+- kdump `202609040702` (uptime 85167 s): crash in a long-running boot.
+- kdump `202609040716` (uptime 730 s): crash right after the first reboot.
+- kdump `202609041234` (12:34): the one the user reported ("reinicou ao
+  desplugar da última vez"). The 12:34 `dmesg` is root-only, but the boot
+  signature is identical: vblank stall WARN at 12:32:07, then boot -2 ends
+  abruptly at 12:34:20 with NO `USB disconnect` line ever reaching the journal,
+  and boot -1 (44 s) is the kdump capture boot (`kdump-tools-dump.service`).
+  I.e.: screen went black (stall) → user unplugged → panic in disconnect →
+  kdump → automatic reboot. Same as 0716.
+
+### Crash 1 — OOB write in fl2000_stream_compress (kdump 202609040702)
+
+    fbcon restore path: drm_release → drm_client_dev_restore → commit
+    → fl2000_display_update → fb2000_dirty → fl2000_stream_compress
+    #PF supervisor WRITE, RIP fl2000_stream_compress+0x16e
+
+Registers at fault: width 1920, height 1080, pitch 7680 (0x1e00) — while the
+log right before shows `Mode configured: 1024x768 RGB888`. The fbdev client's
+restore commit put its old 1920x1080 fb onto the 1024x768 preferred mode
+(`drm_set_preferred_mode(1024,768)`); the atomic plane check clips silently,
+but `fb2000_dirty()` passed `fb->height/fb->width` to compress — walking
+6.2 MB into 2.25 MB buffers. OOB page fault, machine down.
+
+Fix (fl2000_drm.c): `fb2000_dirty()` now takes clip dims from the caller;
+`fl2000_display_update()` clips to `crtc->state->adjusted_mode`
+hdisplay/vdisplay. Plus a defensive check in `fl2000_stream_compress()`
+that drops the frame if `height*width*bytes_pix > buf_size` instead of
+walking off the buffers.
+
+### Crash 2 — hot-unplug panic: use-after-free in fl2000_stream_disable (kdump 202609040716, and the 12:34 one)
+
+    hub_event → usb_disconnect → fl2000_disconnect → fl2000_drm_unbind
+    → fl2000_drm_if_release → drm_atomic_helper_shutdown
+    → drm_atomic_helper_disable_all → fl2000_display_disable
+    → fl2000_stream_disable → up() → Oops (NULL deref in __up)
+
+Root cause: `fl2000_drm_if_release()` destroyed the stream
+(`fl2000_stream_destroy()` frees the devres) BEFORE
+`drm_atomic_helper_shutdown()` ran. Shutdown runs a disable-all commit whose
+`.disable` callback calls `fl2000_stream_disable(drm_if->stream)` — a
+dangling pointer. The `!stream || IS_ERR(stream)` guards added in commit
+974fe1d are useless against dangling: the freed devres node was reused/zeroed
+and `up()` went to address 0x8. Every hot-unplug under an active stream was
+a latent panic — this is the "reiniciou novamente" bug.
+
+Fix (fl2000_drm.c): `fl2000_drm_if_release()` order is now
+
+    component_unbind_all → drm_kms_helper_poll_fini
+    → drm_atomic_helper_shutdown   (pipe callbacks still see a live stream)
+    → drm_dev_unplug                (drm_dev_enter fails: no late commit/restore)
+    → fl2000_stream_destroy + drm_if->stream = NULL
+    → fl2000_intr_destroy  + drm_if->intr = NULL
+    → drm_edid_free
+
+The unplug-before-destroy also closes the fbdev-restore-after-teardown window
+of crash 1: after `drm_dev_unplug()`, `fb2000_dirty()` fails fast via
+`drm_dev_enter()`.
+
+### The recurring black screen — evidence, not a guess any more
+
+The journal shows `vblank wait timed out` on commit_work at 09:53, 11:01,
+12:15 (boot -3) and 12:32 (boot -2). Vblanks on this device ARE URB
+completions, so each WARN is a post-mortem of a silent streaming stall: the
+monitor loses sync (black), the connector still reports connected (mouse
+cursor travels across the dead output), and no driver error is logged
+anywhere.
+
+Host-side analysis: the transmit worker's semaphore/URB accounting is
+balanced (every `down()` either submits a URB — which guarantees a future
+`up()` from its completion — or `continue`s only while ≥1 URB is in flight),
+and every worker exit path logs. So a silent stall means the chip or the
+xHCI endpoint stopped completing bulk URBs. Wedged, in-flight, zero
+completions: the driver had no way to even notice.
+
+Fix (fl2000_streaming.c): a stall watchdog.
+
+- `last_completion` jiffies stamped in the data completion.
+- Watchdog `delayed_work` on its own workqueue (`fl2000_stall`, freezable —
+  the transmit worker parks inside its work function on `work_sem`, so an
+  ordered queue shared with it would never get to run). Poll 1 s, stall
+  threshold 250 ms.
+- On stall, a ladder (all steps log loudly — this is the evidence the
+  previous occurrences never left):
+  1. soft recovery ×2: scuttle the anchor (never poison — poison blocks
+     until the HCD returns every URB, which never happens on a wedged port
+     and would pin the watchdog worker) + kick the worker twice.
+  2. hard recovery ×2: `fl2000_stream_reprogram()` in fl2000_drm.c —
+     app-reset + reprogram the last mode (PLL/timings/pixfmt/transfers/
+     interrupts/AFE, same sequence as output_mode_set; config stored in
+     drm_if). Control transfers with bounded timeout, cannot hang. If the
+     reset chip resumes ACKing, the scuttled in-flight URBs complete and
+     their buffers return by themselves.
+  3. give up: one loud error telling the user to replug; keeps watching and
+     logs "stream resumed" if it ever comes back on its own.
+- Armed in `fl2000_stream_enable()`, cancelled in `fl2000_stream_disable()`
+  (first thing after `enabled = false`) and in release.
+
+Known accepted race: the hard reprogram takes no modeset locks, so it could
+interleave with a real modeset; a stalled output is already broken and the
+next modeset rewrites everything anyway.
+
+### Also fixed
+
+`fl2000_submit_urb()` (fl2000.h): retried -ENXIO/-ENOMEM with `cond_resched()`
+unconditionally — called from the interrupt URB's completion (hard IRQ) this
+would BUG ("scheduling while atomic"). Retry now only when `!in_interrupt()`.
+
+### Test procedure (needs sudo, which this session could not run)
+
+The dongle is currently plugged and the OLD module is loaded (refcount 3,
+compositor holds the card): rmmod is impossible until unplug.
+
+1. `cd /home/xbral/fl2000_driver && make && sudo ./install.sh`
+   (install.sh: unplug → `sudo rmmod fl2000` → install → replug+modprobe)
+2. To avoid exercising the OLD module's unplug-panic path during the swap,
+   disable the VGA output in the desktop display settings first (stream
+   stopped ⇒ `drm_atomic_helper_shutdown` has no active CRTC to disable ⇒
+   the UAF path is not reached), then unplug.
+3. `sudo rmmod fl2000`, replug the dongle (USB-3 port!), confirm the new
+   module binds: `dmesg | grep fl2000`, `cat /proc/sys/kernel/tainted` should
+   stay without the W bit.
+4. Re-enable the display. Then:
+   - Unplug with the stream ACTIVE (the old panic scenario) — expect a clean
+     unbind, no reboot, no kdump dir in /var/crash.
+   - Normal use at 1920x1080. If the screen goes black again, the watchdog
+     now says exactly what happened in dmesg (`stream stall: ... soft
+     recovery`, `chip reset recovery`, or `giving up`). Collect that log —
+     it decides whether the stall is chip-side (recovery helps) or xHCI-side
+     (recovery fails, next step would be endpoint reset at the USB layer).
+5. No dry-run trigger for the watchdog is known (the stall is spontaneous);
+   just use the machine and watch dmesg if the screen ever goes black.
+
+### Loose ends / next session
+
+- If the watchdog's hard recovery works (screen comes back), consider arming
+  it permanently and lowering the thresholds (250 ms is conservative).
+- If the stall persists through hard recovery, suspect the xHCI endpoint:
+  a next step is `usb_reset_device()` from the watchdog (heavier, revokes
+  all interfaces — needs care with the three-interface binding) or digging
+  into xHCI event/TRB logs when it happens.
+- /var/crash/202609041234/dmesg is root-only; confirm its trace matches
+  crash 2 when convenient (`sudo cat /var/crash/202609041234/dmesg.202609041234 | grep -A30 BUG`).
+- 3 kdumps ate ~1.2 GB in /var/crash; safe to delete the vmcores once the
+  traces are confirmed.
+- The 07:02 crash also proves the fbdev client restore path is exercised on
+  every compositor crash/fd close; the clip fix covers the geometry mismatch,
+  but `drm_set_preferred_mode(1024,768)` vs the 1080p fbdev fb mismatch is
+  worth a look if restore glitches remain.
