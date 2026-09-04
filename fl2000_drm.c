@@ -698,9 +698,25 @@ int fl2000_drm_bind(struct device *master)
 
 	/* Start streaming interface */
 	drm_if->stream = fl2000_stream_create(usb_dev, &drm_if->pipe.crtc);
+	if (IS_ERR(drm_if->stream)) {
+		ret = PTR_ERR(drm_if->stream);
+		drm_if->stream = NULL;
+		dev_err(drm->dev, "Cannot create streaming interface (%d)", ret);
+		dev_set_drvdata(master, NULL);
+		return ret;
+	}
 
 	/* Start interrupts interface */
 	drm_if->intr = fl2000_intr_create(usb_dev, drm);
+	if (IS_ERR(drm_if->intr)) {
+		ret = PTR_ERR(drm_if->intr);
+		drm_if->intr = NULL;
+		dev_err(drm->dev, "Cannot create interrupt interface (%d)", ret);
+		fl2000_stream_destroy(usb_dev);
+		drm_if->stream = NULL;
+		dev_set_drvdata(master, NULL);
+		return ret;
+	}
 
 	/* Attach bridge. In VGA mode there is no component to bind - the connector created above
 	 * stands in for it

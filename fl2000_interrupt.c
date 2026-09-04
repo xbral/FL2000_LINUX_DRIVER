@@ -34,11 +34,22 @@ static void fl2000_intr_release(struct device *dev, void *res)
 	struct fl2000_intr *intr = res;
 	struct usb_device *usb_dev = to_usb_device(dev);
 
-	usb_poison_urb(intr->urb);
+	if (!intr || IS_ERR(intr))
+		return;
+	if (intr->urb)
+		usb_poison_urb(intr->urb);
 	cancel_work_sync(&intr->work);
-	destroy_workqueue(intr->work_queue);
-	usb_free_coherent(usb_dev, INTR_BUFSIZE, intr->buf, intr->transfer_dma);
-	usb_free_urb(intr->urb);
+	if (intr->work_queue) {
+		destroy_workqueue(intr->work_queue);
+		intr->work_queue = NULL;
+	}
+	if (intr->buf)
+		usb_free_coherent(usb_dev, INTR_BUFSIZE, intr->buf, intr->transfer_dma);
+	intr->buf = NULL;
+	if (intr->urb) {
+		usb_free_urb(intr->urb);
+		intr->urb = NULL;
+	}
 }
 
 static void fl2000_intr_completion(struct urb *urb)
@@ -47,12 +58,16 @@ static void fl2000_intr_completion(struct urb *urb)
 	struct usb_device *usb_dev = urb->dev;
 	struct fl2000_intr *intr = urb->context;
 
+	if (!intr || IS_ERR(intr))
+		return;
 	ret = fl2000_urb_status(usb_dev, urb->status, urb->pipe);
 	if (ret) {
 		dev_err(&usb_dev->dev, "Stopping interrupts");
 		return;
 	}
 
+	if (!intr->work_queue)
+		return;
 	/* This possibly involves reading I2C registers, etc. so better to schedule a work queue */
 	queue_work(intr->work_queue, &intr->work);
 

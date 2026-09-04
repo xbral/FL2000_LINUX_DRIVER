@@ -127,7 +127,11 @@ static int fl2000_stream_get_buffers(struct fl2000_stream *stream, unsigned int 
 	int ret;
 	struct fl2000_stream_buf *cur_sb;
 
-	BUG_ON(!list_empty(&stream->render_list));
+	/* Um modeset não pode derrubar a máquina: se algo chegou aqui com a
+	 * lista ocupada, devolve erro em vez de BUG_ON (panic/reboot).
+	 */
+	if (WARN_ON(!list_empty(&stream->render_list)))
+		return -EBUSY;
 
 	for (int i = 0; i < FL2000_SB_NUM; i++) {
 		cur_sb = fl2000_alloc_sb(size);
@@ -152,8 +156,13 @@ static void fl2000_stream_release(struct device *dev, void *res)
 
 	UNUSED(dev);
 
-	fl2000_stream_disable(stream);
-	destroy_workqueue(stream->work_queue);
+	if (!stream || IS_ERR(stream))
+		return;
+	if (stream->work_queue) {
+		fl2000_stream_disable(stream);
+		destroy_workqueue(stream->work_queue);
+		stream->work_queue = NULL;
+	}
 	fl2000_stream_put_buffers(stream);
 }
 
@@ -162,6 +171,14 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	struct fl2000_stream_buf *cur_sb = urb->transfer_buffer;
 	struct usb_device *usb_dev = urb->dev;
 	struct fl2000_stream *stream = urb->context;
+
+	/* Desancora primeiro: sem isso a âncora acumulava todos os URBs já
+	 * completados (leak) e usb_wait_anchor_empty_timeout() no disable
+	 * nunca esvaziava — todo disable/modeset travava 1 s com todos os
+	 * modeset locks presos, congelando todas as telas. Com o unanchor a
+	 * âncora rastreia só os URBs em voo (0-2) e o disable retorna rápido.
+	 */
+	usb_unanchor_urb(urb);
 
 	if (stream) {
 		unsigned long flags;
@@ -362,6 +379,9 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	unsigned long flags;
 	static unsigned long drop_count;
 
+	if (!stream || IS_ERR(stream) || !src)
+		return;
+
 	/* Toma posse de um buffer livre e converte SEM lock e COM irqs ligadas.
 	 * Antes, os ~4 MB de conversão rodavam sob spin_lock_irqsave — ms com
 	 * IRQs desligadas a cada damage, que é exatamente a "travada" da máquina
@@ -424,6 +444,11 @@ int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_p
 	unsigned int size;
 	unsigned long flags;
 
+	if (!stream || IS_ERR(stream))
+		return -ENODEV;
+	if (!pixels || !bytes_pix)
+		return -EINVAL;
+
 	/* Round buffer size up to multiple of 8 to meet HW expectations */
 	size = (pixels * bytes_pix + 7) & ~7U;
 
@@ -461,6 +486,10 @@ int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_p
 
 int fl2000_stream_enable(struct fl2000_stream *stream)
 {
+	if (!stream || IS_ERR(stream))
+		return -ENODEV;
+	if (!stream->work_queue)
+		return -ENODEV;
 	/* Antes era BUG_ON(transmit vazio) — um modeset sem damage prévio
 	 * derrubava a máquina. Se não há frame novo, o worker gera via
 	 * fallback (último frame / zero). Kick reduzido: 2 URBs em voo
@@ -487,6 +516,12 @@ int fl2000_stream_enable(struct fl2000_stream *stream)
 void fl2000_stream_disable(struct fl2000_stream *stream)
 {
 	struct fl2000_stream_buf *cur_sb;
+	unsigned long flags;
+
+	if (!stream || IS_ERR(stream))
+		return;
+	if (!stream->work_queue)
+		return;
 
 	stream->enabled = false;
 
@@ -508,7 +543,7 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 		usb_scuttle_anchored_urbs(&stream->anchor);
 	}
 
-	spin_lock_irq(&stream->list_lock);
+	spin_lock_irqsave(&stream->list_lock, flags);
 	while (!list_empty(&stream->transmit_list)) {
 		cur_sb = list_first_entry(&stream->transmit_list, struct fl2000_stream_buf, list);
 		list_move_tail(&cur_sb->list, &stream->render_list);
@@ -517,7 +552,7 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 		cur_sb = list_first_entry(&stream->wait_list, struct fl2000_stream_buf, list);
 		list_move_tail(&cur_sb->list, &stream->render_list);
 	}
-	spin_unlock(&stream->list_lock);
+	spin_unlock_irqrestore(&stream->list_lock, flags);
 }
 
 /**
