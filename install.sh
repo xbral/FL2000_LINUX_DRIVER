@@ -3,7 +3,7 @@
 # Run AFTER unloading the module: unplug dongle -> rmmod fl2000 -> this script -> modprobe.
 set -eu
 
-SRC=/home/xbral/fl2000_driver
+SRC=$(cd "$(dirname "$0")" && pwd)
 VER=1.0.2
 KVER=${1:-$(uname -r)}
 DKMS_SRC=/usr/src/fl2000_drm-$VER

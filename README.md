@@ -37,29 +37,131 @@ for the chip's integrated VGA DAC.
 The full investigation record — every dead end included — is in
 [NOTES.md](NOTES.md).
 
-### Quick start
+### Install in 5 minutes (Ubuntu / Debian / Pop!_OS)
 
-Requirements: kernel headers and build tools (`build-essential`,
-`linux-headers-$(uname -r)`).
+> **VGA dongles must be plugged into a USB 3 port (usually blue).**
+> On USB 2 the device fails to enumerate — see [troubleshooting](#troubleshooting).
+
+**1. Install dependencies** (compiler, kernel headers, DKMS so the driver
+survives kernel updates):
 
 ```
+sudo apt update
+sudo apt install -y git build-essential linux-headers-$(uname -r) dkms
+```
+
+<details>
+<summary>Fedora / Arch commands</summary>
+
+```
+# Fedora
+sudo dnf install -y git gcc make kernel-devel dkms
+# Arch
+sudo pacman -S --needed git base-devel linux-headers dkms
+```
+
+</details>
+
+**2. Clone the driver:**
+
+```
+git clone https://github.com/xbral/FL2000_LINUX_DRIVER.git
+cd FL2000_LINUX_DRIVER
+```
+
+**3. Install with DKMS** (unplug the dongle first if it is plugged in):
+
+```
+sudo ./install.sh
+```
+
+**4. Enable VGA mode** (only for VGA dongles; skip for HDMI/IT66121 dongles):
+
+```
+echo "options fl2000 vga_mode=1" | sudo tee /etc/modprobe.d/fl2000.conf
+```
+
+**5. Load the driver and replug the dongle:**
+
+```
+sudo modprobe fl2000
+```
+
+Unplug and replug the dongle if it was already connected. Your monitor
+should appear as a normal display and be enabled by the desktop
+automatically (check *Settings → Displays*).
+
+**Verify it worked:**
+
+```
+lsusb -d 1d5c:2000             # the dongle must be listed (Fresco Logic)
+dmesg | grep -i fl2000 | tail  # probe lines, no errors
+ls /sys/class/drm/             # a card*-VGA-1 connector should exist
+```
+
+### Manual install without DKMS (quick test)
+
+If you just want to try the driver once without installing anything:
+
+```
+sudo apt install -y git build-essential linux-headers-$(uname -r)
+git clone https://github.com/xbral/FL2000_LINUX_DRIVER.git
+cd FL2000_LINUX_DRIVER
 make
-sudo modprobe drm_dma_helper
+sudo modprobe drm_kms_helper
 sudo insmod fl2000.ko vga_mode=1
 ```
 
-A connected VGA monitor should appear as a normal display and be enabled by
-your desktop automatically.
+To unload: unplug the dongle first, then `sudo rmmod fl2000`.
+After a kernel update you must `make` again — prefer the DKMS method
+above for permanent use.
 
-**USB 3 ports only.** The FL2000's descriptors declare duplicate endpoints,
-which modern kernels reject when the device enumerates at USB 2 speed
-(`can't set config #1, error -71`). On USB 3 the affected interfaces use
-alternate settings and enumerate fine.
+### Secure Boot
 
-Without `vga_mode=1` the driver behaves like upstream (HDMI/IT66121 path).
-Debugging aids from the investigation are also available: `probe_only=1`
-brings up only the USB/register/I2C layer, and `dump_regs=1` dumps raw chip
-state at probe.
+If `modprobe`/`insmod` fails with `Required key not available`, your
+system has Secure Boot on and refuses unsigned modules. Easiest options:
+
+- **Enroll a key and sign (Ubuntu/Debian):** after `make`, run from the
+  repo root `sudo ./scripts/sign.sh`, then
+  `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der` and reboot to
+  enroll the key. Re-sign after every rebuild.
+- **Or disable Secure Boot** in the BIOS/UEFI settings.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `dmesg` shows `can't set config #1, error -71` | The dongle enumerated at USB 2 speed. The FL2000's descriptors declare duplicate endpoints, which modern kernels reject on USB 2 (on USB 3 the interfaces use alternate settings and enumerate fine). Plug into a **USB 3 port directly**, no USB 2 hub or extension. |
+| `Required key not available` on load | Secure Boot is blocking the unsigned module — see [Secure Boot](#secure-boot). |
+| `make` fails with missing headers | Install `linux-headers-$(uname -r)` and make sure the version matches `uname -r` exactly. |
+| Driver worked, then broke after an update | Kernel was updated. DKMS installs rebuild automatically (`AUTOINSTALL=yes`); check with `dkms status`. Manual installs need `make` + reload again. |
+| Monitor detected but stays black | Check the cable and try a lower mode (start with 1024x768@60). To isolate a framebuffer-copy problem, load with `test_fill=1` (`sudo modprobe -r fl2000 && sudo modprobe fl2000 vga_mode=1 test_fill=1`): a white screen proves the chip/DAC path works. |
+| `rmmod` hangs or says module in use | Unplug the dongle first and close anything using the display, then retry. |
+| HDMI dongle (IT66121 bridge) | Skip step 4 (`vga_mode`) and additionally load the bridge: `sudo insmod it66121.ko` (manual method). |
+
+Still stuck? Open an issue with the output of `uname -r`,
+`lsusb -d 1d5c:2000`, `dmesg | grep -i -E 'fl2000|usb' | tail -30`,
+and whether the port is USB 2 or 3.
+
+### Uninstall
+
+```
+sudo dkms remove fl2000_drm/1.0.2 --all
+sudo rm -f /etc/modprobe.d/fl2000.conf
+sudo modprobe -r fl2000
+```
+
+### Module options
+
+| Option | Default | What it does |
+|---|---|---|
+| `vga_mode=1` | `0` | Drive the integrated VGA DAC directly (VGA dongles). Without it the driver uses the upstream HDMI/IT66121 path. |
+| `test_fill=1` | `0` | Stream solid white instead of framebuffer content (black-screen diagnostic, changeable at runtime). |
+| `force_bpp=2` | `0` (auto) | Force bytes per pixel: `2` = RGB565, `3` = RGB888 (changeable at runtime, applies on next modeset). |
+| `probe_only=1`, `dump_regs=1` | `0` | Bring up only USB/register/I2C without a DRM device, and dump raw chip state — debugging aids, see NOTES.md. |
+
+Runtime-tunable options can also be changed without reloading, e.g.
+`echo 1 | sudo tee /sys/module/fl2000/parameters/test_fill`.
 
 ### Tested on
 
