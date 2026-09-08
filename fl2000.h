@@ -212,6 +212,11 @@ extern bool fl2000_test_fill;
  */
 extern int fl2000_force_bpp;
 
+/* Once a monitor has been seen, never report the VGA connector as disconnected.
+ * Defined in fl2000_drv.c
+ */
+extern bool fl2000_sticky_connect;
+
 /* DRM device creation */
 int fl2000_drm_bind(struct device *master);
 void fl2000_drm_unbind(struct device *master);

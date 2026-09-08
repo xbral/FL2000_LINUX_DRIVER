@@ -65,6 +65,17 @@ MODULE_PARM_DESC(force_bpp,
 		 "modeset. Auto uses RGB565 when the pixel clock would drain more USB bandwidth than "
 		 "the bus sustains (e.g. 1920x1080@60 on USB 3.0)");
 
+/* Incident #3: the chip's monitor-detect circuit can die mid-session (sense==0 / control
+ * reads failing) with the VGA cable still attached, and reporting a disconnect makes the
+ * compositor kill the output - black screen until the dongle is replugged. Once the sense
+ * register has seen a monitor, keep reporting connected no matter what it says later
+ */
+bool fl2000_sticky_connect = true;
+module_param_named(sticky_connect, fl2000_sticky_connect, bool, 0644);
+MODULE_PARM_DESC(sticky_connect,
+		 "Once a monitor has been seen, never report the VGA connector as disconnected "
+		 "(default 1). Set to 0 to trust the sense register unconditionally");
+
 static struct usb_device_id fl2000_id_table[] = {
 	{ USB_DEVICE_INTERFACE_CLASS(USB_VENDOR_FRESCO_LOGIC, USB_PRODUCT_FL2000, USB_CLASS_AV) },
 	{},

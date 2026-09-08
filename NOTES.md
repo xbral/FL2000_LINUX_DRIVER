@@ -1011,6 +1011,33 @@ compositor holds the card): rmmod is impossible until unplug.
 5. No dry-run trigger for the watchdog is known (the stall is spontaneous);
    just use the machine and watch dmesg if the screen ever goes black.
 
+### Incident #3 — false disconnect killed the output (2026-09-08)
+
+Different signature from the recurring stream stall (no `stream stall` logs
+at all — the watchdog never fired, so the bulk stream was alive until the
+end). Journal evidence, boot 18:32, 1920x1080@60 RGB565:
+
+    19:02:39  i2c rd addr 0x50 off 0x00 timed out: post 0x0 (done 0 status 0x0
+              ready 0 mon_det 0 edid_det 0)   <- chip detect circuit says NO monitor
+    19:05:03  same i2c timeout again
+    19:07:41  WARN drm_atomic_helper_wait_for_vblanks: vblank wait timed out (commit_work)
+    19:20:15  usb 4-1: USB disconnect         <- user unplugged the dongle
+
+The DDC fallback in `fl2000_connector_detect()` ran because the 0x805C sense
+read itself failed (control-plane of the detect block went down mid-session).
+`mon_det=0` + hung i2c with the cable still attached: the chip's detect block
+died, the poll reported disconnected, the compositor disabled the output — the
+~10 s vblank wait holding every modeset lock is the "froze, then went black"
+the user saw. Replugging the dongle restores it every time.
+
+Conclusion: sense==0 / sense-error is NOT proof the monitor is gone; only
+sense==1 is trustworthy. Fix (commit `sticky-connect`): once the sense
+register has seen a monitor in this session, `detect()` stays connected no
+matter what it reports later (`monitor_seen` latch in fl2000_drm_if).
+`sticky_connect=0` restores the old behavior. A genuinely unplugged monitor
+just keeps receiving signal — harmless — while the false-disconnect class
+(black screen needing a dongle replug) is eliminated.
+
 ### Loose ends / next session
 
 - If the watchdog's hard recovery works (screen comes back), consider arming

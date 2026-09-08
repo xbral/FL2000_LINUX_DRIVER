@@ -8,6 +8,22 @@ VER=1.0.2
 KVER=${1:-$(uname -r)}
 DKMS_SRC=/usr/src/fl2000_drm-$VER
 
+if lsmod | grep -q '^fl2000 '; then
+    cat <<'EOF'
+ERROR: fl2000 is still loaded in memory. Installing now would only replace
+the file on disk; the OLD module keeps running until reboot (the crash of
+2026-09-08 18:30 happened exactly because the old build stayed loaded).
+
+Do, in order:
+  1. Disable the VGA output in the desktop display settings (stream stopped).
+  2. Physically unplug the dongle.
+  3. sudo rmmod fl2000
+  4. Re-run this script.
+  5. Replug the dongle (USB-3 port) and confirm: dmesg | grep fl2000
+EOF
+    exit 1
+fi
+
 rm -rf "$DKMS_SRC"
 mkdir -p "$DKMS_SRC/bridge"
 cp "$SRC"/*.c "$SRC"/*.h "$SRC"/Makefile "$DKMS_SRC"/

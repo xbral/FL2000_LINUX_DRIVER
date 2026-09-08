@@ -115,6 +115,13 @@ struct fl2000_drm_if {
 	struct fl2000_timings last_timings;
 	unsigned int last_bytes_pix;
 	bool mode_config_valid;
+
+	/* Sticky presence latch (incident #3): once the sense register has seen the monitor
+	 * this session, a later sense==0/error no longer reports a disconnect - the detect
+	 * circuit can die mid-session with the cable still attached, and a false disconnect
+	 * makes the compositor kill the output (black screen until the dongle is replugged)
+	 */
+	bool monitor_seen;
 };
 
 /* Read one EDID block over the FL2000's own I2C master.
@@ -226,10 +233,31 @@ static enum drm_connector_status fl2000_connector_detect(struct drm_connector *c
 	 * read rápido (0x805C); DDC é 1 dword com poll-loop de até 100 ms e
 	 * NAKa mesmo com monitor Windows-provado (NOTES.md Round 2-4) — fazia
 	 * o poll travar centenas de ms e era a "travadinha" periódica.
+	 *
+	 * Incident #3: o bloco de detect do chip morreu no meio da sessão
+	 * (mon_det=0, i2c pendurado) com o cabo VGA preso. O sense==0/erro virava
+	 * "disconnected", o compositor desligava a saída e a tela ficava preta
+	 * até replugar o dongle. Conclusão: o sense NÃO prova ausência de monitor
+	 * (só o sentido 1 é confiável), então depois de ver o monitor uma vez na
+	 * sessão, a saída fica ligada por insistência (sticky) — um monitor
+	 * realmente removido apenas continua recebendo sinal, inofensivo.
 	 */
 	sense = fl2000_connector_sense(drm_if->usb_dev);
-	if (sense == 1)
+	if (sense == 1) {
+		drm_if->monitor_seen = true;
 		return connector_status_connected;
+	}
+
+	/* Sense falhou ou diz "sem monitor" depois de já ter visto um: mantenha
+	 * a saída viva. sticky_connect=0 restaura o comportamento antigo.
+	 */
+	if (drm_if->monitor_seen && fl2000_sticky_connect) {
+		dev_warn_ratelimited(&drm_if->usb_dev->dev,
+			"detect: sense says no monitor (ret %d) but monitor was seen; staying connected "
+			"(sticky_connect=0 to trust the sense register)", sense);
+		return connector_status_connected;
+	}
+
 	if (sense == 0)
 		return connector_status_disconnected;
 
