@@ -116,12 +116,25 @@ struct fl2000_drm_if {
 	unsigned int last_bytes_pix;
 	bool mode_config_valid;
 
+	/* Serializes the chip register programming sequence between a real modeset
+	 * (fl2000_output_mode_set) and the watchdog's hard recovery (fl2000_stream_reprogram).
+	 * Without it the two sequences could interleave register writes; both run in process
+	 * context (atomic commit worker vs. watchdog workqueue), so a mutex is enough
+	 */
+	struct mutex mode_lock;
+
 	/* Sticky presence latch (incident #3): once the sense register has seen the monitor
 	 * this session, a later sense==0/error no longer reports a disconnect - the detect
 	 * circuit can die mid-session with the cable still attached, and a false disconnect
 	 * makes the compositor kill the output (black screen until the dongle is replugged)
 	 */
 	bool monitor_seen;
+
+	/* Detect-recovery guard (incident #3): one re-arm attempt per loss episode, so a
+	 * genuinely unplugged monitor does not get a control write every poll. Cleared when
+	 * the sense circuit reports the monitor again
+	 */
+	bool detect_rearm_tried;
 };
 
 /* Read one EDID block over the FL2000's own I2C master.
@@ -176,6 +189,15 @@ static int fl2000_connector_get_modes(struct drm_connector *connector)
 	/* Re-read rather than cache: a VGA sink can be swapped without us being told */
 	drm_edid_free(drm_if->drm_edid);
 	drm_if->drm_edid = drm_edid_read_custom(connector, fl2000_get_edid_block, drm_if);
+
+	/* A replug or a just-revived detect block can NAK the first EDID read; give it one
+	 * bounded retry before falling back to the VESA mode list
+	 */
+	if (!drm_if->drm_edid) {
+		fl2000_detect_rearm(drm_if->usb_dev);
+		msleep(20);
+		drm_if->drm_edid = drm_edid_read_custom(connector, fl2000_get_edid_block, drm_if);
+	}
 
 	drm_edid_connector_update(connector, drm_if->drm_edid);
 
@@ -245,17 +267,35 @@ static enum drm_connector_status fl2000_connector_detect(struct drm_connector *c
 	sense = fl2000_connector_sense(drm_if->usb_dev);
 	if (sense == 1) {
 		drm_if->monitor_seen = true;
+		drm_if->detect_rearm_tried = false;
 		return connector_status_connected;
 	}
 
-	/* Sense falhou ou diz "sem monitor" depois de já ter visto um: mantenha
-	 * a saída viva. sticky_connect=0 restaura o comportamento antigo.
+	/* Sense falhou ou diz "sem monitor" depois de já ter visto um. Antes de acreditar
+	 * (ou de apelar para o latch sticky), tenta rearmar o bloco de detect uma vez por
+	 * episódio: a causa da incident #3 foi exatamente esse bloco morrer, não o cabo sair.
 	 */
-	if (drm_if->monitor_seen && fl2000_sticky_connect) {
-		dev_warn_ratelimited(&drm_if->usb_dev->dev,
-			"detect: sense says no monitor (ret %d) but monitor was seen; staying connected "
-			"(sticky_connect=0 to trust the sense register)", sense);
-		return connector_status_connected;
+	if (drm_if->monitor_seen) {
+		if (!drm_if->detect_rearm_tried) {
+			drm_if->detect_rearm_tried = true;
+
+			if (!fl2000_detect_rearm(drm_if->usb_dev)) {
+				sense = fl2000_connector_sense(drm_if->usb_dev);
+				if (sense == 1) {
+					dev_info_ratelimited(&drm_if->usb_dev->dev,
+						"detect: sense circuit recovered after re-arm");
+					return connector_status_connected;
+				}
+			}
+		}
+
+		/* Mantenha a saída viva. sticky_connect=0 restaura o comportamento antigo. */
+		if (fl2000_sticky_connect) {
+			dev_warn_ratelimited(&drm_if->usb_dev->dev,
+				"detect: sense says no monitor (ret %d) but monitor was seen; staying "
+				"connected (sticky_connect=0 to trust the sense register)", sense);
+			return connector_status_connected;
+		}
 	}
 
 	if (sense == 0)
@@ -598,6 +638,9 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	if (!bytes_pix)
 		return;
 
+	/* Serialize the register sequence against the watchdog's hard recovery */
+	mutex_lock(&drm_if->mode_lock);
+
 	dev_info(drm->dev, "Mode requested:  " DRM_MODE_FMT, DRM_MODE_ARG(mode));
 	dev_info(drm->dev, "Mode configured: " DRM_MODE_FMT, DRM_MODE_ARG(adjusted_mode));
 	dev_info(drm->dev, "Pixel format: %u bytes/pixel (%s)", bytes_pix,
@@ -636,14 +679,15 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	fl2000_stream_mode_set(drm_if->stream, mode->hdisplay * mode->vdisplay, bytes_pix);
 
 	/* Remember the working configuration so the streaming stall watchdog can
-	 * app-reset and reprogram the chip without a full modeset (no locks taken,
-	 * so it can race a real modeset - acceptable: a stalled output is already
-	 * broken and the next modeset rewrites everything anyway)
+	 * app-reset and reprogram the chip without a full modeset. mode_lock keeps this
+	 * snapshot consistent with a concurrent watchdog reprogram
 	 */
 	drm_if->last_pll = pll;
 	drm_if->last_timings = timings;
 	drm_if->last_bytes_pix = bytes_pix;
 	drm_if->mode_config_valid = true;
+
+	mutex_unlock(&drm_if->mode_lock);
 }
 
 /* Chip reprogramming for the streaming stall watchdog's hard recovery: same register
@@ -659,8 +703,12 @@ static int fl2000_stream_reprogram(void *ctx)
 	struct usb_device *usb_dev = drm_if->usb_dev;
 	int ret;
 
-	if (!drm_if->mode_config_valid)
+	mutex_lock(&drm_if->mode_lock);
+
+	if (!drm_if->mode_config_valid) {
+		mutex_unlock(&drm_if->mode_lock);
 		return -ENODEV;
+	}
 
 	dev_err(drm_if->drm.dev, "stream stall: app-reset and reprogramming chip mode");
 
@@ -681,6 +729,8 @@ static int fl2000_stream_reprogram(void *ctx)
 		ret = fl2000_afe_magic(usb_dev);
 	if (!ret)
 		ret = fl2000_usb_magic(usb_dev);
+
+	mutex_unlock(&drm_if->mode_lock);
 
 	return ret;
 }
@@ -745,6 +795,8 @@ int fl2000_drm_bind(struct device *master)
 	struct drm_device *drm;
 	struct drm_mode_config *mode_config;
 	u64 dma_mask;
+	bool bridge_bound = false;
+	bool poll_initialized = false;
 
 	dev_info(master, "Binding FL2000 master");
 
@@ -756,6 +808,7 @@ int fl2000_drm_bind(struct device *master)
 	drm = &drm_if->drm;
 	drm_if->usb_dev = usb_dev;
 	drm->dev_private = drm_if;
+	mutex_init(&drm_if->mode_lock);
 
 	/* Let fl2000_drm_unbind() find us again. master is the i2c adapter device, whose drvdata
 	 * is otherwise unused - this driver never calls i2c_set_adapdata()
@@ -765,7 +818,7 @@ int fl2000_drm_bind(struct device *master)
 	ret = drmm_mode_config_init(drm);
 	if (ret) {
 		dev_err(master, "Cannot initialize DRM mode (%d)", ret);
-		return ret;
+		goto error;
 	}
 
 	mode_config = &drm->mode_config;
@@ -780,7 +833,7 @@ int fl2000_drm_bind(struct device *master)
 	ret = dma_set_coherent_mask(drm->dev, dma_mask);
 	if (ret) {
 		dev_err(drm->dev, "Cannot set DRM device DMA mask (%d)", ret);
-		return ret;
+		goto error;
 	}
 
 	/* On a VGA dongle there is no bridge chip, so stand up our own connector for the chip's
@@ -798,7 +851,7 @@ int fl2000_drm_bind(struct device *master)
 					 DRM_MODE_CONNECTOR_VGA);
 		if (ret) {
 			dev_err(drm->dev, "Cannot initialize VGA connector (%d)", ret);
-			return ret;
+			goto error;
 		}
 	}
 
@@ -807,7 +860,7 @@ int fl2000_drm_bind(struct device *master)
 					   NULL, fl2000_vga_mode ? &drm_if->connector : NULL);
 	if (ret) {
 		dev_err(drm->dev, "Cannot configure simple display pipe (%d)", ret);
-		return ret;
+		goto error;
 	}
 
 	/* Register 'mode_set' function to operate prior to bridge */
@@ -819,8 +872,7 @@ int fl2000_drm_bind(struct device *master)
 		ret = PTR_ERR(drm_if->stream);
 		drm_if->stream = NULL;
 		dev_err(drm->dev, "Cannot create streaming interface (%d)", ret);
-		dev_set_drvdata(master, NULL);
-		return ret;
+		goto error;
 	}
 
 	/* Let the streaming stall watchdog reprogram the chip when bulk transfers wedge */
@@ -832,10 +884,7 @@ int fl2000_drm_bind(struct device *master)
 		ret = PTR_ERR(drm_if->intr);
 		drm_if->intr = NULL;
 		dev_err(drm->dev, "Cannot create interrupt interface (%d)", ret);
-		fl2000_stream_destroy(usb_dev);
-		drm_if->stream = NULL;
-		dev_set_drvdata(master, NULL);
-		return ret;
+		goto error;
 	}
 
 	/* Attach bridge. In VGA mode there is no component to bind - the connector created above
@@ -845,8 +894,9 @@ int fl2000_drm_bind(struct device *master)
 		ret = component_bind_all(master, &drm_if->pipe);
 		if (ret) {
 			dev_err(drm->dev, "Cannot attach bridge (%d)", ret);
-			return ret;
+			goto error;
 		}
+		bridge_bound = true;
 	}
 
 	drm_mode_config_reset(drm);
@@ -855,17 +905,18 @@ int fl2000_drm_bind(struct device *master)
 	if (ret) {
 		dev_err(drm->dev, "Failed to initialize %d VBLANK(s) (%d)",
 			drm->mode_config.num_crtc, ret);
-		return ret;
+		goto error;
 	}
 
 	drm_kms_helper_poll_init(drm);
+	poll_initialized = true;
 
 	drm_plane_enable_fb_damage_clips(&drm_if->pipe.plane);
 
 	ret = drm_dev_register(drm, 0);
 	if (ret) {
 		dev_err(drm->dev, "Cannot register DRM device (%d)", ret);
-		return ret;
+		goto error;
 	}
 
 	fl2000_reset(usb_dev);
@@ -874,6 +925,28 @@ int fl2000_drm_bind(struct device *master)
 	drm_client_setup_with_fourcc(drm, DRM_FORMAT_XRGB8888);
 
 	return 0;
+
+error:
+	/* The stream and interrupt contexts are devres-managed on &usb_dev->dev, which outlives
+	 * this module: a bind failure must release them explicitly or they leak until replug
+	 * (and keep the next probe from re-initialising the chip). The DRM device and its
+	 * mode config are devm/drmm-managed on master and released by the driver core
+	 */
+	if (poll_initialized)
+		drm_kms_helper_poll_fini(drm);
+	if (bridge_bound)
+		component_unbind_all(master, drm);
+	if (drm_if->intr) {
+		fl2000_intr_destroy(usb_dev);
+		drm_if->intr = NULL;
+	}
+	if (drm_if->stream) {
+		fl2000_stream_destroy(usb_dev);
+		drm_if->stream = NULL;
+	}
+	dev_set_drvdata(master, NULL);
+
+	return ret;
 }
 
 void fl2000_drm_unbind(struct device *master)
@@ -890,4 +963,48 @@ void fl2000_drm_unbind(struct device *master)
 	dev_set_drvdata(master, NULL);
 
 	fl2000_drm_if_release(drm_if, master);
+}
+
+/* System sleep. drm_mode_config_helper_suspend() runs a disable-all atomic commit, which
+ * calls the pipe's .disable -> fl2000_stream_disable(), so streaming and the stall watchdog
+ * stop cleanly instead of fighting the frozen USB device
+ */
+int fl2000_drm_suspend(struct device *master)
+{
+	struct fl2000_drm_if *drm_if = dev_get_drvdata(master);
+
+	if (!drm_if)
+		return 0;
+
+	return drm_mode_config_helper_suspend(&drm_if->drm);
+}
+
+int fl2000_drm_resume(struct device *master)
+{
+	struct fl2000_drm_if *drm_if = dev_get_drvdata(master);
+	int ret;
+
+	if (!drm_if)
+		return 0;
+
+	/* The device may have been reset across suspend, which restores altsetting 0: the
+	 * streaming interface needs altsetting 1 back before any bulk URB is submitted
+	 */
+	ret = usb_set_interface(drm_if->usb_dev, FL2000_USBIF_AVCONTROL, 1);
+	if (ret) {
+		dev_err(master, "Cannot restore streaming altsetting on resume (%d)", ret);
+		return ret;
+	}
+
+	/* Reprogram the saved mode (the helper re-runs mode_set + enable), then restore the
+	 * detect/LPM magic that fl2000_reset() inside mode_set wipes
+	 */
+	ret = drm_mode_config_helper_resume(&drm_if->drm);
+
+	fl2000_usb_magic(drm_if->usb_dev);
+
+	/* A device reset across suspend aborts the interrupt URB; restart it if so */
+	fl2000_intr_restart(drm_if->usb_dev);
+
+	return ret;
 }

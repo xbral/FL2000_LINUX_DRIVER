@@ -269,7 +269,7 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 			ret = fl2000_drm_bind(devs->drm_master);
 			if (ret) {
 				dev_err(&usb_dev->dev, "Cannot bind DRM device (%d)", ret);
-				return ret;
+				goto error_put;
 			}
 			devs->drm_bound = true;
 		} else {
@@ -278,11 +278,19 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 			if (ret) {
 				dev_err(&usb_dev->dev, "Cannot register component master (%d)",
 					ret);
-				return ret;
+				goto error_put;
 			}
 			devs->master_added = true;
 		}
 	}
+
+	return ret;
+
+error_put:
+	/* Registration failed: nothing can reach the chip through a DRM device any more, so
+	 * drop the shared regmap/i2c resources instead of leaking them until replug
+	 */
+	fl2000_put_devices(usb_dev, devs);
 
 	return ret;
 }
@@ -325,32 +333,61 @@ static void fl2000_disconnect(struct usb_interface *interface)
 		fl2000_put_devices(usb_dev, devs);
 }
 
+/* Device the DRM pipeline is bound to. VGA mode binds directly on the AVCONTROL interface;
+ * bridge mode binds on the i2c adapter via the component framework
+ */
+static struct device *fl2000_get_master(struct fl2000_devs *devs)
+{
+	if (!devs)
+		return NULL;
+	if (devs->drm_bound)
+		return devs->drm_master;
+	if (devs->master_added)
+		return &devs->adapter->dev;
+	return NULL;
+}
+
 static int fl2000_suspend(struct usb_interface *interface, pm_message_t message)
 {
+	u8 iface_num = interface->cur_altsetting->desc.bInterfaceNumber;
 	struct usb_device *usb_dev = interface_to_usbdev(interface);
+	struct fl2000_devs *devs = dev_get_drvdata(&usb_dev->dev);
+	struct device *master;
 
 	UNUSED(message);
 
-	dev_dbg(&usb_dev->dev, "resume");
-
-	/* TODO: suspend
-	 * drm_mode_config_helper_suspend()
+	/* The USB driver is bound to all three interfaces; only the one that owns the DRM
+	 * device drives the pipeline. Calling the DRM suspend three times would race itself
 	 */
+	if (iface_num != FL2000_USBIF_AVCONTROL)
+		return 0;
 
-	return 0;
+	master = fl2000_get_master(devs);
+	if (!master || !dev_get_drvdata(master))
+		return 0;
+
+	dev_dbg(&usb_dev->dev, "suspend");
+
+	return fl2000_drm_suspend(master);
 }
 
 static int fl2000_resume(struct usb_interface *interface)
 {
+	u8 iface_num = interface->cur_altsetting->desc.bInterfaceNumber;
 	struct usb_device *usb_dev = interface_to_usbdev(interface);
+	struct fl2000_devs *devs = dev_get_drvdata(&usb_dev->dev);
+	struct device *master;
 
-	dev_dbg(&usb_dev->dev, "suspend");
+	if (iface_num != FL2000_USBIF_AVCONTROL)
+		return 0;
 
-	/* TODO: resume
-	 * drm_mode_config_helper_resume()
-	 */
+	master = fl2000_get_master(devs);
+	if (!master || !dev_get_drvdata(master))
+		return 0;
 
-	return 0;
+	dev_dbg(&usb_dev->dev, "resume");
+
+	return fl2000_drm_resume(master);
 }
 
 static struct usb_driver fl2000_driver = {

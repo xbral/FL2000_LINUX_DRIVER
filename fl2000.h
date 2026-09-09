@@ -179,6 +179,12 @@ void fl2000_i2c_cleanup(struct i2c_adapter *adapter);
 struct regmap *fl2000_regmap_init(struct usb_device *usb_dev);
 void fl2000_regmap_cleanup(struct regmap *regmap);
 
+/* Re-arm the chip's EDID/monitor detect circuit. Used by the VGA connector detect path to try
+ * to revive a detect block that died mid-session before falling back to the sticky latch.
+ * Defined in fl2000_registers.c
+ */
+int fl2000_detect_rearm(struct usb_device *usb_dev);
+
 /* Registers interface */
 int fl2000_reset(struct usb_device *usb_dev);
 int fl2000_usb_magic(struct usb_device *usb_dev);
@@ -221,5 +227,11 @@ extern bool fl2000_sticky_connect;
 /* DRM device creation */
 int fl2000_drm_bind(struct device *master);
 void fl2000_drm_unbind(struct device *master);
+
+/* System sleep hooks for the DRM pipeline. Called from the USB interface suspend/resume
+ * callbacks (fl2000_drv.c). Defined in fl2000_drm.c
+ */
+int fl2000_drm_suspend(struct device *master);
+int fl2000_drm_resume(struct device *master);
 
 #endif /* __FL2000_DRM_H__ */

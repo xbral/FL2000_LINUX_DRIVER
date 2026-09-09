@@ -1137,3 +1137,59 @@ Side fixes:
   firmware crashes on some rare race (maybe an underrun). The device reset is
   the only cure; a USB capture of the last traffic before a wedge could
   confirm, but the recovery now makes it self-healing.
+
+## Hardening pass (2026-09-09, session 7)
+
+Software-only improvements from the "what could be better" review. All build
+clean (`make`, `make W=1`) and pass checkpatch on the diff; none touch the
+chip register sequences, so no hardware validation was required to land them.
+
+1. **System suspend/resume implemented** (`fl2000_drv.c`, `fl2000_drm.c`).
+   The old callbacks were stubs with a swapped dev_dbg (suspend logged
+   "resume"). They now drive `drm_mode_config_helper_suspend()/resume()` from
+   the AVCONTROL interface only (the driver is bound to all three interfaces;
+   calling it three times would race itself). Resume restores the streaming
+   altsetting, re-programs the saved mode through the helper, re-applies
+   `fl2000_usb_magic()` and restarts the interrupt URB. The freezable stream
+   worker exits on the freezer's fake signal (`down_interruptible` -> -EINTR),
+   so streaming is already stopped before the USB device suspends.
+
+2. **Modeset vs. watchdog reprogram serialized** (`fl2000_drm.c`). The accepted
+   race from session 4 (hard recovery reprogramming registers without modeset
+   locks) is closed with a `mode_lock` mutex held around the register sequence
+   in both `fl2000_output_mode_set()` and `fl2000_stream_reprogram()`. Both run
+   in process context (commit worker vs. watchdog workqueue), so a mutex is
+   sufficient and cannot deadlock against the stream worker.
+
+3. **Bind failure now cleans up** (`fl2000_drm.c`, `fl2000_drv.c`). Every early
+   return in `fl2000_drm_bind()` went to a single error path that releases the
+   stream/interrupt devres (they live on `&usb_dev->dev` and would otherwise
+   leak until replug), tears down the bridge/poll if already up and clears the
+   master drvdata. `fl2000_probe()` frees the shared regmap/i2c resources when
+   registration fails instead of leaking them (the old "TODO: Halt driver on
+   initialization failure").
+
+4. **Detect circuit re-arm instead of pure sticky** (`fl2000_drm.c`,
+   `fl2000_registers.c`). On sense != 1 with the monitor already seen, the
+   driver now rewrites the detect enable bits once per loss episode and re-reads
+   `0x805C`. If the block comes back it reports connected; only then does it
+   fall back to the sticky latch. A genuinely unplugged monitor costs one
+   control write per episode, not one per 10 s poll.
+
+5. **EDID read retry** (`fl2000_drm.c`). A failed first `drm_edid_read_custom()`
+   is retried once after re-arming the detect block (replug / just-revived
+   block) before falling back to the VESA mode list.
+
+6. **Stall forensics** (`fl2000_streaming.c`). The watchdog now logs the last
+   URB status plus per-session completion/error counters, and snapshots the
+   chip status register (`fl2000_log_vga_status()`) at the first soft recovery.
+   Control transfers still complete during the wedge, so this captures the
+   chip's own view of the dead output - the evidence every previous occurrence
+   never left. Root cause (why the streaming engine wedges) still needs the USB
+   capture noted above.
+
+7. **IT66121 DDC serialization** (`bridge/it66121_drv.c`). Added the mutex the
+   old `XXX: lock` comments called for, around the DDC handshakes in the
+   interrupt worker and the full EDID read sequence.
+
+8. **`make check`** runs sparse (`C=1`) for static analysis; optional, not in CI.

@@ -366,6 +366,26 @@ int fl2000_connector_sense(struct usb_device *usb_dev)
 	return val != 0;
 }
 
+/* Re-arm the EDID/monitor detect block (incident #3). The chip's detect circuit can stop
+ * reporting the attached monitor mid-session; the same two enable bits that fl2000_usb_magic()
+ * sets are rewritten here to try to revive it before the connector falls back to the sticky
+ * latch. Bounded, no reset and no timing changes, so it is safe to call from the output poll.
+ * Returns 0 on success (the bits were written), negative errno on transfer failure.
+ */
+int fl2000_detect_rearm(struct usb_device *usb_dev)
+{
+	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
+	union fl2000_vga_i2c_sc_reg reg = { .val = 0 };
+	u32 mask = 0;
+
+	reg.monitor_detect = true;
+	fl2000_add_bitmask(mask, union fl2000_vga_i2c_sc_reg, monitor_detect);
+	reg.edid_detect = true;
+	fl2000_add_bitmask(mask, union fl2000_vga_i2c_sc_reg, edid_detect);
+
+	return regmap_write_bits(regmap, FL2000_VGA_I2C_SC_REG, mask, reg.val);
+}
+
 /* Round 5 experiments: values below are VERBATIM from the Windows USBPcap capture
  * (~/src/fl2000/win-capture.pcapng, NOTES.md "Round 5") of this exact dongle+monitor working.
  * Not decoded through our field unions on purpose - the point is replaying known-good state

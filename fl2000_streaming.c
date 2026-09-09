@@ -93,6 +93,12 @@ struct fl2000_stream {
 	unsigned long last_completion;
 	unsigned int stall_recoveries;
 	bool gave_up;
+	/* Stall forensics: the last completion status and per-session counters, so a wedge
+	 * leaves evidence in dmesg (previously the stall was completely silent)
+	 */
+	int last_urb_status;
+	unsigned int completion_count;
+	unsigned int error_count;
 	/* Chip reprogramming callback for hard recovery, registered by the DRM layer
 	 * which knows the current mode. Plain function pointer + ctx: the DRM device
 	 * outlives the stream (fl2000_drm_if_release destroys in that order)
@@ -239,6 +245,10 @@ static void fl2000_stream_data_completion(struct urb *urb)
 
 		/* Any completion proves the pipeline is alive: reset the stall episode */
 		stream->last_completion = jiffies;
+		stream->last_urb_status = urb->status;
+		stream->completion_count++;
+		if (urb->status)
+			stream->error_count++;
 
 		drm_crtc_handle_vblank(stream->crtc);
 
@@ -443,8 +453,15 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		struct urb *stuck;
 
 		dev_err(&stream->usb_dev->dev,
-			"stream stall: no URB completion for %ld ms (%u URBs in flight), soft recovery %u",
-			stalled_ms, inflight, stream->stall_recoveries);
+			"stream stall: no URB completion for %ld ms (%u URBs in flight), soft recovery %u (last status %d, %u completions, %u errors)",
+			stalled_ms, inflight, stream->stall_recoveries, stream->last_urb_status,
+			stream->completion_count, stream->error_count);
+
+		/* Snapshot the chip's own status register: control transfers still work during
+		 * this wedge, so this is the chip's view of the dead output - the evidence every
+		 * previous occurrence never captured
+		 */
+		fl2000_log_vga_status(stream->usb_dev);
 
 		/* Ask the HCD to cancel the stuck URBs. Never poison/kill: both block
 		 * until the HCD gives every URB back, which never happens on a wedged
@@ -537,6 +554,9 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		stream->last_completion = jiffies;
 		stream->stall_recoveries = 0;
 		stream->gave_up = false;
+		stream->last_urb_status = 0;
+		stream->completion_count = 0;
+		stream->error_count = 0;
 		queue_work(stream->work_queue, &stream->work);
 		for (int i = 0; i < FL2000_MAX_INFLIGHT; i++)
 			up(&stream->work_sem);
@@ -720,6 +740,9 @@ int fl2000_stream_enable(struct fl2000_stream *stream)
 	stream->last_completion = jiffies;
 	stream->stall_recoveries = 0;
 	stream->gave_up = false;
+	stream->last_urb_status = 0;
+	stream->completion_count = 0;
+	stream->error_count = 0;
 	queue_work(stream->work_queue, &stream->work);
 
 	/* Kick transmit workqueue with minimum buffers submitted */

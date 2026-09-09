@@ -19,6 +19,11 @@ all:	modules
 modules:
 	make -C $(KSRC) M=$(CURDIR) modules
 
+# Static analysis with sparse (kernel's __CHECKER__ build). Optional: needs `sparse`
+# installed. Run before sending patches; not part of the default build
+check:
+	make -C $(KSRC) M=$(CURDIR) C=1 modules
+
 clean:
 	make -C $(KSRC) M=$(CURDIR) clean
 	rm -f $(CURDIR)/Module.symvers $(CURDIR)/*.ur-safe

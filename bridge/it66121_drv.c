@@ -24,6 +24,12 @@ struct it66121_priv {
 	struct drm_connector connector;
 	enum drm_connector_status conn_status;
 
+	/* Serializes the multi-transfer DDC sequences between the interrupt worker and an
+	 * EDID read from the probe path. regmap only locks individual accesses, not the
+	 * command/status handshakes these sequences depend on
+	 */
+	struct mutex lock;
+
 	struct delayed_work work;
 	struct workqueue_struct *work_queue;
 
@@ -301,7 +307,8 @@ static void it66121_intr_work(struct work_struct *work_item)
 
 		regmap_field_write(priv->clr_irq, 1);
 
-		/* XXX: lock */
+		/* Keep the DDC handshakes atomic against an EDID read from the probe path */
+		mutex_lock(&priv->lock);
 
 		if (status_1.ddc_fifo_err)
 			it66121_clear_ddc_fifo(priv);
@@ -316,7 +323,7 @@ static void it66121_intr_work(struct work_struct *work_item)
 			}
 		}
 
-		/* XXX: unlock */
+		mutex_unlock(&priv->lock);
 	}
 
 	if (event)
@@ -325,7 +332,7 @@ static void it66121_intr_work(struct work_struct *work_item)
 	queue_delayed_work(priv->work_queue, &priv->work, msecs_to_jiffies(IRQ_POLL_INTRVL));
 }
 
-static int it66121_get_edid_block(void *context, u8 *buf, unsigned int block, size_t len)
+static int it66121_get_edid_block_locked(void *context, u8 *buf, unsigned int block, size_t len)
 {
 	int ret;
 	size_t remain = len;
@@ -392,6 +399,19 @@ static int it66121_get_edid_block(void *context, u8 *buf, unsigned int block, si
 		remain -= size;
 		offset += size;
 	}
+
+	return ret;
+}
+
+/* Serialize the whole DDC read sequence against the interrupt worker */
+static int it66121_get_edid_block(void *context, u8 *buf, unsigned int block, size_t len)
+{
+	struct it66121_priv *priv = context;
+	int ret;
+
+	mutex_lock(&priv->lock);
+	ret = it66121_get_edid_block_locked(context, buf, block, len);
+	mutex_unlock(&priv->lock);
 
 	return ret;
 }
@@ -861,6 +881,8 @@ static int __init it66121_probe(void)
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+
+	mutex_init(&priv->lock);
 
 	priv->client = it66121_i2c_init();
 	if (IS_ERR(priv->client)) {

@@ -20,7 +20,11 @@ for the chip's integrated VGA DAC.
   found by raw-diffing chip state against physical cable changes. It reads
   zero with no cable and a stable analog-sense pattern with a monitor
   attached, which lets `detect()` report real `connected`/`disconnected`
-  states — desktops auto-enable the display on plug-in.
+  states — desktops auto-enable the display on plug-in. If the chip's detect
+  block dies mid-session the driver re-arms it before falling back to a
+  sticky "stay connected" latch.
+- **System suspend/resume** of the DRM pipeline, so closing the lid no longer
+  leaves a dead output behind.
 - **Port to current kernels** (developed and tested on 7.0; upstream baseline
   was 6.5): fbdev client API, `struct drm_edid` API, bridge attach signature.
 - **Five teardown/lifetime fixes**, several of which likely correspond to
