@@ -118,7 +118,11 @@ static inline int fl2000_urb_status(struct usb_device *usb_dev, int status, int 
 		/* Not an error */
 		break;
 	default:
-		dev_err(&usb_dev->dev, "Nonzero urb status, %d\n", status);
+		/* Ratelimited: a wedged streaming engine can complete thousands of
+		 * URBs per second with -EPROTO, and a synchronous dev_err() per
+		 * completion floods the log while the watchdog is trying to run.
+		 */
+		dev_err_ratelimited(&usb_dev->dev, "Nonzero urb status, %d\n", status);
 		break;
 	}
 

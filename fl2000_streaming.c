@@ -243,8 +243,16 @@ static void fl2000_stream_data_completion(struct urb *urb)
 		list_move_tail(&cur_sb->list, &stream->render_list);
 		spin_unlock_irqrestore(&stream->list_lock, flags);
 
-		/* Any completion proves the pipeline is alive: reset the stall episode */
-		stream->last_completion = jiffies;
+		/* Only a SUCCESSFUL completion proves the pipeline is delivering pixels.
+		 * Error completions (e.g. an -EPROTO flood while the chip's streaming
+		 * engine is wedged) still call back at frame rate and previously kept
+		 * refreshing the stall timer, so the watchdog never fired: black screen,
+		 * thousands of logged errors, no recovery, manual replug required. Leave
+		 * the timer alone on errors so the ladder (unlink -> endpoint reset ->
+		 * device reset) runs and self-heals.
+		 */
+		if (!urb->status)
+			stream->last_completion = jiffies;
 		stream->last_urb_status = urb->status;
 		stream->completion_count++;
 		if (urb->status)

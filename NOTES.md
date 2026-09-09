@@ -1193,3 +1193,94 @@ chip register sequences, so no hardware validation was required to land them.
    interrupt worker and the full EDID read sequence.
 
 8. **`make check`** runs sparse (`C=1`) for static analysis; optional, not in CI.
+
+## EPROTO flood slipped past the watchdog (2026-09-09, session 8)
+
+User report: "o monitor parou de exibir imagem novamente, tive que retirar o
+dongle para poder voltar a ter imagem". New signature, same wedge underneath.
+Journal (boot Sep 9 13:26, 1920x1080@60 RGB565):
+
+    17:53:36  usb 4-1: Nonzero urb status, -71   (first of a flood)
+    ...       5308 x -71 over 74 s (EPROTO), monitor black
+    17:54:50  usb 4-1: USB disconnect -> user unplugs to recover
+    17:56:39  replug: Bind, Mode configured, picture back
+
+No `stream stall` / `recovery` / `gave up` line was ever logged: the watchdog
+never fired. Root cause in `fl2000_stream_data_completion()`: `last_completion`
+was refreshed on *every* completion, including error ones. The wedge had
+changed shape from the old silent one (zero completions) to an -EPROTO flood
+(completions at frame rate, none of them carrying pixels), so the liveness
+signal the watchdog keys on stayed fresh while the output was dead. The whole
+recovery ladder - including the USB device reset that is the only rung that
+actually revives this wedge - was never reached, forcing a physical replug.
+
+Fix:
+
+- `fl2000_stream_data_completion()` refreshes `last_completion` only when
+  `urb->status == 0`. Any error completion leaves the timer alone, so a
+  sustained error flood trips the 250 ms threshold and the existing ladder runs
+  (soft unlink -> endpoint reset -> device reset), turning the manual replug
+  into a ~4 s self-heal. A lone transient error followed by a success still
+  clears the episode as before.
+- `fl2000_urb_status()` logs the unexpected status with
+  `dev_err_ratelimited()`. 5308 synchronous `dev_err()` calls in 74 s flooded
+  the log; the watchdog's own message remains the forensic evidence.
+
+Not changed: the ladder order. Soft/endpoint rungs are known no-ops for this
+wedge (session 6), but they are cheap, bounded, and harmless on the EPROTO
+path (the in-flight URBs give back -ENOENT on unlink), and keeping one generic
+ladder avoids a second recovery code path.
+
+Verification: next EPROTO flood must show `stream stall: no URB completion ...`
+followed by `endpoint reset recovery` / `USB device reset recovery` in dmesg
+within a few seconds, and the picture should return without unplugging.
+
+### Install blocker found while testing: Xwayland pins deleted DRM nodes
+
+With the dongle already unplugged, `rmmod fl2000` still failed with `in use`
+(refcnt 6). Cause: **Xwayland (PID 6651) held three open fds to deleted DRM
+nodes** - `card0`, `card2` and `card3`, the last being this dongle's card. Each
+open fd holds `try_module_get(fl2000_drm_driver_fops.owner)` (the
+`DEFINE_DRM_GEM_FOPS` owner is THIS_MODULE), so the compositor's X11 proxy kept
+the module alive after the USB device was gone. Killing Xwayland released 3 of
+the 6 references; the remaining 3 are a genuine refcount leak not tied to any
+fd or sysfs device (`find /proc/*/fd`, `/sys/bus/usb/drivers/fl2000_usb`,
+`/sys/class/drm` all clean), and `CONFIG_MODULE_FORCE_UNLOAD` is off, so only a
+reboot clears them. Recorded as a separate pre-existing bug; it does not affect
+the display fix but does break the unplug -> rmmod -> install loop.
+
+Installed 1.0.4 to disk while the old module was still resident (safe: file
+copy only) and rebooted to load it, since a fresh module load is required.
+
+Investigated with kprobes (session 8, after the reboot). Conclusion: **there is
+no driver-side refcount leak.** The refs are all userspace DRM opens.
+
+- In this kernel a driver bound to a device does **not** hold a module
+  reference: `usbhid` has 3 bound interfaces and `refcnt 0`. So the fl2000
+  refcount comes only from explicit `try_module_get()` calls.
+- The DRM and fbdev layers take one per user `open()` and drop it on `release`:
+  `DEFINE_DRM_GEM_FOPS` sets `fops->owner = THIS_MODULE`;
+  `drm_fbdev_shmem_fb_open()` does
+  `try_module_get(fb_helper->dev->driver->fops->owner)`; `i2cdev_open()` /
+  `i2c_get_adapter()` take one on `adapter->owner` (i2c-15 here, no openers).
+- With the dongle plugged, `refcnt` matches the userspace clients:
+  `/sys/kernel/debug/dri/2/clients` lists only `systemd-logind` and
+  `gnome-shell`, and the fd scan adds Xwayland's stale `card0 (deleted)`. The
+  fl2000 card is DRM minor 2 (`card2`) on this boot; `card0` is a dead minor
+  from the pre-reboot session.
+- No leaked DRM device in `/sys/kernel/debug/dri/`, no leftover `4-1:*`
+  interfaces, no leaked fbdev - the kernel objects are all torn down.
+
+The recurring blocker is therefore userspace: after hot-unplug the compositor
+closes its own card fd (observed as a `module_put` from gnome-shell), but
+**Xwayland keeps a stale fd to the deleted node**, pinning the module. Multiple
+unplug/replug cycles can leave more than one. `rmmod` is blocked by design while
+any such fd is open (`CONFIG_MODULE_FORCE_UNLOAD` off), so module swaps still
+need `rmmod` after the fds close - i.e. restart Xwayland/log out, or reboot.
+This is not a driver bug and needs no kernel change; a driver cannot force a
+userspace fd closed.
+
+Note for the kprobe technique: filter the `try_module_get`/`module_put`
+arguments with `m=$arg1` (not `%di`) and remember to clear the `stacktrace`
+trigger (`echo '!stacktrace' > events/kprobes/EV/trigger`) before deleting the
+probe, otherwise `kprobe_events` stays busy.
