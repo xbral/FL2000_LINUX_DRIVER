@@ -1082,3 +1082,58 @@ Notes:
   it before arming).
 - Verification: next stall should show `endpoint reset recovery 3`/`4` lines
   between the soft and chip reset lines.
+
+## Device reset rung: the stall recovery that actually works (2026-09-09, session 6)
+
+Field evidence, today (boot Sep 8 20:29):
+
+    38364  Mode configured 1920x1080 (streaming starts)
+    54434  stream stall - 4.5 HOURS of clean streaming before the wedge
+    54527  stream re-enable (modeset) - stall again within 1 s: chip still wedged
+    54558  replug -> Mode configured, streaming resumes
+    54897  stream stall - 5.6 MINUTES this time
+    55031  user unplug; replug -> EDID fail at bind -> no modeset -> black screen
+
+Every rung of the existing ladder failed. Why:
+
+1. **Soft rung was a no-op.** Scuttling removes the stuck URBs from the anchor
+   but the HCD still owns them; the two buffers pin `wait_list` at
+   FL2000_MAX_INFLIGHT and the worker's throttle (`continue` while
+   inflight >= 2) blocks every resubmission. Recovery literally could not
+   submit anything.
+2. **Endpoint reset refused.** `usb_reset_endpoint` is a no-op on xHCI while
+   the ring has pending TDs: dmesg shows `EP not empty, refuse reset`.
+3. **Chip app-reset is irrelevant.** Control transfers complete, the chip
+   reprogram succeeds (no errors logged), but bulk completions never resume:
+   the chip's *streaming engine* is wedged and its app-reset doesn't touch it.
+
+Only a physical replug revived the display — a port reset. So the fix gives
+the watchdog a software port reset:
+
+    recoveries 1-2   soft: pop anchor + usb_unlink_urb each stuck URB (async
+                     cancellation; givebacks return the buffers and the worker
+                     resubmits). Unlink, not scuttle: scuttle lost the URB
+                     references, unlink actually cancels them.
+    recovery 3       usb_reset_endpoint (kept; now meaningful if the unlink
+                     givebacks emptied the ring)
+    recoveries 4-5   usb_lock_device_for_reset + usb_reset_device: park the
+                     worker (enabled=false + drain) so no URB is submitted
+                     across the reset, reset the port, reprogram the chip from
+                     its post-reset state (reprogram callback now also
+                     re-selects the streaming altsetting and runs
+                     fl2000_usb_magic), restart the interrupt URB
+                     (fl2000_intr_restart - the reset aborts it and the
+                     completion no longer resubmits on aborts), re-init the
+                     anchor/semaphore and restart the stream.
+    recovery 6       give up
+
+Side fixes:
+- fl2000_intr_completion() marks the URB inactive on aborts instead of
+  resubmitting into a resetting device (which always failed -ENODEV).
+- Expected side effect of the hard rung: the monitor blinks ~1-2 s during the
+  device reset (chip re-inits). Better than a permanent black screen.
+- Open question for prevention: the wedge interval is wildly variable (4.5 h
+  vs 5.6 min), so it is not a steady drift - looks like the chip's streaming
+  firmware crashes on some rare race (maybe an underrun). The device reset is
+  the only cure; a USB capture of the last traffic before a wedge could
+  confirm, but the recovery now makes it self-healing.

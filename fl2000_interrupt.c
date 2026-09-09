@@ -13,6 +13,7 @@ struct fl2000_intr {
 	struct drm_device *drm;
 	u8 poll_interval;
 	struct urb *urb;
+	bool active;
 	u8 *buf;
 	dma_addr_t transfer_dma;
 	struct work_struct work;
@@ -60,9 +61,16 @@ static void fl2000_intr_completion(struct urb *urb)
 
 	if (!intr || IS_ERR(intr))
 		return;
-	ret = fl2000_urb_status(usb_dev, urb->status, urb->pipe);
-	if (ret) {
-		dev_err(&usb_dev->dev, "Stopping interrupts");
+
+	if (urb->status) {
+		/* Aborts from a device reset/unlink (-ECONNRESET, -ENOENT,
+		 * -ESHUTDOWN) are expected: the stall watchdog's device-reset
+		 * recovery restarts this URB via fl2000_intr_restart() after the
+		 * reset. Anything else is a real error and stops interrupts.
+		 */
+		if (fl2000_urb_status(usb_dev, urb->status, urb->pipe))
+			dev_err(&usb_dev->dev, "Stopping interrupts");
+		intr->active = false;
 		return;
 	}
 
@@ -81,8 +89,31 @@ static void fl2000_intr_completion(struct urb *urb)
 	ret = fl2000_submit_urb(urb, GFP_ATOMIC);
 	if (ret) {
 		dev_err(&usb_dev->dev, "URB submission failed (%d)", ret);
+		intr->active = false;
 		/* TODO: Signal fault to system and start shutdown of usb_dev */
 	}
+}
+
+/* Resubmit the interrupt URB after a USB device reset aborted it. Called by the
+ * streaming stall watchdog's device-reset recovery; no-op while the URB is alive.
+ */
+void fl2000_intr_restart(struct usb_device *usb_dev)
+{
+	struct fl2000_intr *intr;
+	int ret;
+
+	intr = devres_find(&usb_dev->dev, fl2000_intr_release, NULL, NULL);
+	if (!intr || !intr->urb || intr->active)
+		return;
+
+	intr->urb->interval = intr->poll_interval;
+	intr->urb->start_frame = -1;
+	ret = fl2000_submit_urb(intr->urb, GFP_KERNEL);
+	if (ret) {
+		dev_err(&usb_dev->dev, "Interrupt URB restart failed (%d)", ret);
+		return;
+	}
+	intr->active = true;
 }
 
 /**
@@ -158,6 +189,7 @@ struct fl2000_intr *fl2000_intr_create(struct usb_device *usb_dev, struct drm_de
 		devres_release(&usb_dev->dev, fl2000_intr_release, NULL, NULL);
 		return ERR_PTR(ret);
 	}
+	intr->active = true;
 
 	return intr;
 }

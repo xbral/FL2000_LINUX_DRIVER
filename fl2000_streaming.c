@@ -41,17 +41,28 @@
  * logs it (the missing evidence for every previous occurrence) and attempts recovery.
  *
  * Recovery ladder, in escalation order:
- *   1-2  soft: scuttle the anchor and kick the worker (chip may just be slow)
- *   3-4  host endpoint reset: when control transfers still complete but bulk never
- *        resumes, the bulk endpoint state on the host side is the prime suspect
- *   5-8  hard: app-reset the chip and reprogram the mode (control-plane is alive)
- *   9    give up: only a physical replug revives the display
+ *   1-2  soft: unlink the stuck URBs and kick the worker. Unlink requests
+ *        cancellation from the HCD; if the endpoint is merely starved the
+ *        givebacks return the buffers and the worker resubmits. (Scuttling
+ *        was tried first and is useless here: the scuttled URBs never come
+ *        back, so the stuck buffers pin wait_list at FL2000_MAX_INFLIGHT and
+ *        the throttle blocks every resubmission - recovery was a no-op.)
+ *   3    host endpoint reset: if the unlink givebacks emptied the ring but
+ *        the endpoint is left in a bad state. Refused with "EP not empty"
+ *        when the ring still has TDs, in which case we escalate anyway.
+ *   4-5  hard: full USB device reset (usb_reset_device). The wedge signature
+ *        is: control transfers complete, chip app-reset succeeds, but bulk
+ *        completions never resume - the chip's streaming engine is dead and
+ *        nothing short of a port reset (what a physical replug does) revives
+ *        it. After the reset the chip is reprogrammed from scratch and the
+ *        stream restarted.
+ *   6    give up: only a physical replug revives the display
  */
 #define FL2000_STALL_TIMEOUT msecs_to_jiffies(250)
 #define FL2000_WATCHDOG_PERIOD msecs_to_jiffies(1000)
 #define FL2000_STALL_SOFT_TRIES 2
-#define FL2000_STALL_EP_TRIES 2
-#define FL2000_STALL_HARD_TRIES 4
+#define FL2000_STALL_EP_TRIES 1
+#define FL2000_STALL_RESET_TRIES 2
 
 struct fl2000_stream_buf {
 	struct list_head list;
@@ -429,19 +440,24 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 	stream->stall_recoveries++;
 
 	if (stream->stall_recoveries <= FL2000_STALL_SOFT_TRIES) {
+		struct urb *stuck;
+
 		dev_err(&stream->usb_dev->dev,
 			"stream stall: no URB completion for %ld ms (%u URBs in flight), soft recovery %u",
 			stalled_ms, inflight, stream->stall_recoveries);
 
-		/* Scuttle, never poison: poison blocks until the HCD gives every URB back,
-		 * which never happens on a wedged port and would pin this worker forever.
-		 * Scuttled URBs are dropped from the anchor without waiting; if the chip
-		 * comes back to life their completions still fire and the buffers return
+		/* Ask the HCD to cancel the stuck URBs. Never poison/kill: both block
+		 * until the HCD gives every URB back, which never happens on a wedged
+		 * port and would pin this worker forever. Each URB is popped from the
+		 * anchor (the giveback's unanchor becomes a no-op) and unlinked
+		 * asynchronously; when a giveback lands, the completion returns the
+		 * buffer and kicks the worker.
 		 */
-		usb_scuttle_anchored_urbs(&stream->anchor);
+		while ((stuck = usb_get_from_anchor(&stream->anchor)) != NULL)
+			usb_unlink_urb(stuck);
 
 		/* Restart the self-sustaining transmit loop with whatever buffers are on
-		 * render_list
+		 * render_list once the givebacks land
 		 */
 		up(&stream->work_sem);
 		up(&stream->work_sem);
@@ -451,37 +467,79 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 			"stream stall persists, endpoint reset recovery %u",
 			stream->stall_recoveries);
 
-		/* The chip reset rung below has a distinguishing signature: the control
-		 * transfers still complete (app reset succeeds) while bulk completions
-		 * never resume. That combination points at the bulk endpoint state on
-		 * the host side rather than the chip: reset the endpoint in the HCD,
-		 * which flushes its queues and re-primes the transfer ring. Cheap and
-		 * bounded; if the HCD does not support endpoint reset it silently
-		 * does nothing and we escalate to the chip reset.
+		/* Only meaningful after the unlink givebacks emptied the ring; the HCD
+		 * refuses ("EP not empty") while TDs are still pending, which is fine -
+		 * the device reset rung below handles that case.
 		 */
 		usb_reset_endpoint(stream->usb_dev, 0x01);
 
 		up(&stream->work_sem);
 		up(&stream->work_sem);
 	} else if (stream->stall_recoveries <=
-		   FL2000_STALL_SOFT_TRIES + FL2000_STALL_EP_TRIES + FL2000_STALL_HARD_TRIES) {
-		int ret = -ENODEV;
+		   FL2000_STALL_SOFT_TRIES + FL2000_STALL_EP_TRIES + FL2000_STALL_RESET_TRIES) {
+		int ret;
 
-		dev_err(&stream->usb_dev->dev, "stream stall persists, chip reset recovery %u",
+		dev_err(&stream->usb_dev->dev,
+			"stream stall persists, USB device reset recovery %u",
 			stream->stall_recoveries);
 
-		/* Soft recovery did not revive the bulk stream: app-reset the chip and
-		 * reprogram the current mode (control transfers, bounded by the control
-		 * timeout - cannot hang). A reset chip may resume ACKing, which also
-		 * releases the scuttled in-flight URBs and their buffers
+		/* The distinguishing signature: control transfers still complete (chip
+		 * app-reset succeeds) while bulk completions never resume. The chip's
+		 * streaming engine is wedged and only a port reset - exactly what a
+		 * physical replug does - revives it. Do that in software.
+		 *
+		 * Park the transmit worker first: it must not submit URBs across the
+		 * reset (usb_submit_urb on a resetting device fails and would kill the
+		 * stream). The reset aborts every URB in flight and its givebacks
+		 * return all buffers to render_list.
 		 */
-		if (stream->reprogram)
-			ret = stream->reprogram(stream->reprogram_ctx);
-		if (ret)
-			dev_err(&stream->usb_dev->dev, "chip reprogramming failed (%d)", ret);
+		stream->enabled = false;
+		up(&stream->work_sem);
+		drain_workqueue(stream->work_queue);
 
-		up(&stream->work_sem);
-		up(&stream->work_sem);
+		ret = usb_lock_device_for_reset(stream->usb_dev, NULL);
+		if (ret >= 0) {
+			ret = usb_reset_device(stream->usb_dev);
+			if (ret)
+				dev_err(&stream->usb_dev->dev, "USB device reset failed (%d)", ret);
+			usb_unlock_device(stream->usb_dev);
+		} else {
+			dev_err(&stream->usb_dev->dev, "Cannot lock device for reset (%d)", ret);
+		}
+
+		if (ret)
+			goto rearm;
+
+		/* Reprogram the chip from its post-reset state: the reset restores
+		 * altsetting 0 and wipes every register, so the mode (PLL/timings/
+		 * pixfmt/transfers/interrupts/AFE/magic) must be written again, and
+		 * the interrupt URB (aborted by the reset) restarted.
+		 */
+		if (stream->reprogram && stream->reprogram(stream->reprogram_ctx))
+			dev_err(&stream->usb_dev->dev,
+				"chip reprogramming after device reset failed");
+
+		fl2000_intr_restart(stream->usb_dev);
+
+		/* Any URB still anchored here is a giveback straggler from the reset.
+		 * The device is healthy again, so they give back quickly; poison only
+		 * as a bounded fallback before the clean re-init.
+		 */
+		if (!usb_wait_anchor_empty_timeout(&stream->anchor, 1000)) {
+			usb_poison_anchored_urbs(&stream->anchor);
+			usb_scuttle_anchored_urbs(&stream->anchor);
+		}
+		init_usb_anchor(&stream->anchor);
+
+		/* Restart the streaming session */
+		sema_init(&stream->work_sem, 0);
+		stream->enabled = true;
+		stream->last_completion = jiffies;
+		stream->stall_recoveries = 0;
+		stream->gave_up = false;
+		queue_work(stream->work_queue, &stream->work);
+		for (int i = 0; i < FL2000_MAX_INFLIGHT; i++)
+			up(&stream->work_sem);
 	} else {
 		stream->gave_up = true;
 		dev_err(&stream->usb_dev->dev,

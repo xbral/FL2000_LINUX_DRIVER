@@ -647,8 +647,11 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 }
 
 /* Chip reprogramming for the streaming stall watchdog's hard recovery: same register
- * sequence as fl2000_output_mode_set(). Control transfers with a bounded timeout, so it
- * cannot hang even against a wedged chip. Called from the watchdog's own workqueue.
+ * sequence as fl2000_output_mode_set(), preceded by the streaming altsetting re-select
+ * and followed by fl2000_usb_magic() - both required because the watchdog now recovers
+ * with a full USB device reset, which restores altsetting 0 and wipes every register.
+ * Control transfers with a bounded timeout, so it cannot hang even against a wedged
+ * chip. Called from the watchdog's own workqueue.
  */
 static int fl2000_stream_reprogram(void *ctx)
 {
@@ -661,7 +664,9 @@ static int fl2000_stream_reprogram(void *ctx)
 
 	dev_err(drm_if->drm.dev, "stream stall: app-reset and reprogramming chip mode");
 
-	ret = fl2000_set_pll(usb_dev, &drm_if->last_pll);
+	ret = usb_set_interface(usb_dev, FL2000_USBIF_AVCONTROL, 1);
+	if (!ret)
+		ret = fl2000_set_pll(usb_dev, &drm_if->last_pll);
 	if (!ret)
 		ret = fl2000_reset(usb_dev);
 	if (!ret)
@@ -674,6 +679,8 @@ static int fl2000_stream_reprogram(void *ctx)
 		ret = fl2000_enable_interrupts(usb_dev);
 	if (!ret)
 		ret = fl2000_afe_magic(usb_dev);
+	if (!ret)
+		ret = fl2000_usb_magic(usb_dev);
 
 	return ret;
 }

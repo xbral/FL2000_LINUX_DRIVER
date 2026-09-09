@@ -4,7 +4,7 @@
 set -eu
 
 SRC=$(cd "$(dirname "$0")" && pwd)
-VER=1.0.2
+VER=1.0.3
 KVER=${1:-$(uname -r)}
 DKMS_SRC=/usr/src/fl2000_drm-$VER
 

@@ -169,6 +169,7 @@ void fl2000_stream_set_recovery(struct fl2000_stream *stream, void *ctx,
 struct fl2000_intr;
 struct fl2000_intr *fl2000_intr_create(struct usb_device *usb_dev, struct drm_device *drm);
 void fl2000_intr_destroy(struct usb_device *usb_dev);
+void fl2000_intr_restart(struct usb_device *usb_dev);
 
 /* I2C adapter interface creation */
 struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev);
