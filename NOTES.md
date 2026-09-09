@@ -1054,3 +1054,31 @@ just keeps receiving signal — harmless — while the false-disconnect class
   every compositor crash/fd close; the clip fix covers the geometry mismatch,
   but `drm_set_preferred_mode(1024,768)` vs the 1080p fbdev fb mismatch is
   worth a look if restore glitches remain.
+
+## Endpoint reset rung in the stall ladder (2026-09-08, session 5)
+
+Incident at 20:12: the recurring spontaneous stall again, but with new
+evidence: the watchdog's hard recovery ran twice and **succeeded** (app-reset
++ reprogram completed, no errors) yet the bulk stream never resumed — control
+plane alive, bulk plane dead. That signature points at the xHCI bulk endpoint
+state, not the chip.
+
+Change (fl2000_streaming.c): inserted a host-side endpoint reset rung between
+soft and hard recovery:
+
+    recoveries 1-2   soft: scuttle anchor + kick worker (unchanged)
+    recoveries 3-4   usb_reset_endpoint(usb_dev, 0x01)  <-- new
+    recoveries 5-8   chip app-reset + mode reprogram (unchanged)
+    recovery 9       give up (unchanged)
+
+Notes:
+- `usb_reset_endpoint()` returns void on kernel 7.0 (no error to log).
+- It is a no-op on xHCI unless the endpoint is in HALTED/STOPPED state, so a
+  device-side NAK wedge (endpoint still "Running") may not be cured by it —
+  but it is cheap, bounded and the designated first host-side attempt. If it
+  proves ineffective, the next hammer is `usb_queue_reset_device()` (deferred
+  full re-enumeration; safe from the watchdog workqueue, but tears down and
+  recreates all three interfaces — verify the component rebind path handles
+  it before arming).
+- Verification: next stall should show `endpoint reset recovery 3`/`4` lines
+  between the soft and chip reset lines.

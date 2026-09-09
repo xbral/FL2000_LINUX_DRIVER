@@ -39,10 +39,18 @@
  * and goes black while the connector still reports connected (observed repeatedly,
  * silent - see NOTES.md "black screen" vblank WARNs). The watchdog detects that,
  * logs it (the missing evidence for every previous occurrence) and attempts recovery.
+ *
+ * Recovery ladder, in escalation order:
+ *   1-2  soft: scuttle the anchor and kick the worker (chip may just be slow)
+ *   3-4  host endpoint reset: when control transfers still complete but bulk never
+ *        resumes, the bulk endpoint state on the host side is the prime suspect
+ *   5-8  hard: app-reset the chip and reprogram the mode (control-plane is alive)
+ *   9    give up: only a physical replug revives the display
  */
 #define FL2000_STALL_TIMEOUT msecs_to_jiffies(250)
 #define FL2000_WATCHDOG_PERIOD msecs_to_jiffies(1000)
 #define FL2000_STALL_SOFT_TRIES 2
+#define FL2000_STALL_EP_TRIES 2
 #define FL2000_STALL_HARD_TRIES 4
 
 struct fl2000_stream_buf {
@@ -437,7 +445,26 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		 */
 		up(&stream->work_sem);
 		up(&stream->work_sem);
-	} else if (stream->stall_recoveries <= FL2000_STALL_HARD_TRIES) {
+	} else if (stream->stall_recoveries <=
+		   FL2000_STALL_SOFT_TRIES + FL2000_STALL_EP_TRIES) {
+		dev_err(&stream->usb_dev->dev,
+			"stream stall persists, endpoint reset recovery %u",
+			stream->stall_recoveries);
+
+		/* The chip reset rung below has a distinguishing signature: the control
+		 * transfers still complete (app reset succeeds) while bulk completions
+		 * never resume. That combination points at the bulk endpoint state on
+		 * the host side rather than the chip: reset the endpoint in the HCD,
+		 * which flushes its queues and re-primes the transfer ring. Cheap and
+		 * bounded; if the HCD does not support endpoint reset it silently
+		 * does nothing and we escalate to the chip reset.
+		 */
+		usb_reset_endpoint(stream->usb_dev, 0x01);
+
+		up(&stream->work_sem);
+		up(&stream->work_sem);
+	} else if (stream->stall_recoveries <=
+		   FL2000_STALL_SOFT_TRIES + FL2000_STALL_EP_TRIES + FL2000_STALL_HARD_TRIES) {
 		int ret = -ENODEV;
 
 		dev_err(&stream->usb_dev->dev, "stream stall persists, chip reset recovery %u",
