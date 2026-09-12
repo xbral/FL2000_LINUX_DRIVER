@@ -390,12 +390,48 @@ static int fl2000_resume(struct usb_interface *interface)
 	return fl2000_drm_resume(master);
 }
 
+/* usb_reset_device() reaches these before/after it resets the port. Providing both keeps
+ * the interface bound: without them the USB core force-unbinds it, and that unbind runs the
+ * DRM shutdown synchronously inside the streaming stall watchdog's own work item, which
+ * then self-deadlocks and freezes the machine (2026-09-10). Only the interface that owns
+ * the DRM pipeline acts; returning 0 means "no unbind/rebind needed".
+ */
+static int fl2000_pre_reset(struct usb_interface *interface)
+{
+	u8 iface_num = interface->cur_altsetting->desc.bInterfaceNumber;
+	struct usb_device *usb_dev = interface_to_usbdev(interface);
+	struct fl2000_devs *devs = dev_get_drvdata(&usb_dev->dev);
+	struct device *master = fl2000_get_master(devs);
+
+	if (iface_num != FL2000_USBIF_AVCONTROL || !master || !dev_get_drvdata(master))
+		return 0;
+
+	dev_dbg(&usb_dev->dev, "pre_reset");
+	return fl2000_drm_pre_reset(master);
+}
+
+static int fl2000_post_reset(struct usb_interface *interface)
+{
+	u8 iface_num = interface->cur_altsetting->desc.bInterfaceNumber;
+	struct usb_device *usb_dev = interface_to_usbdev(interface);
+	struct fl2000_devs *devs = dev_get_drvdata(&usb_dev->dev);
+	struct device *master = fl2000_get_master(devs);
+
+	if (iface_num != FL2000_USBIF_AVCONTROL || !master || !dev_get_drvdata(master))
+		return 0;
+
+	dev_dbg(&usb_dev->dev, "post_reset");
+	return fl2000_drm_post_reset(master);
+}
+
 static struct usb_driver fl2000_driver = {
 	.name = USB_DRIVER_NAME,
 	.probe = fl2000_probe,
 	.disconnect = fl2000_disconnect,
 	.suspend = fl2000_suspend,
 	.resume = fl2000_resume,
+	.pre_reset = fl2000_pre_reset,
+	.post_reset = fl2000_post_reset,
 	.id_table = fl2000_id_table,
 	.supports_autosuspend = false,
 	.disable_hub_initiated_lpm = true,

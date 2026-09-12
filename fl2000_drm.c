@@ -108,8 +108,9 @@ struct fl2000_drm_if {
 	struct drm_connector connector;
 	const struct drm_edid *drm_edid;
 
-	/* Last mode programmed into the chip, kept for the streaming stall watchdog's hard
-	 * recovery (chip app-reset + reprogram). Filled by fl2000_output_mode_set()
+	/* Last mode programmed into the chip, kept so post_reset can reprogram it after a
+	 * USB device reset (chip app-reset + register replay). Filled by
+	 * fl2000_output_mode_set()
 	 */
 	struct fl2000_pll last_pll;
 	struct fl2000_timings last_timings;
@@ -117,7 +118,7 @@ struct fl2000_drm_if {
 	bool mode_config_valid;
 
 	/* Serializes the chip register programming sequence between a real modeset
-	 * (fl2000_output_mode_set) and the watchdog's hard recovery (fl2000_stream_reprogram).
+	 * (fl2000_output_mode_set) and the post_reset reprogram (fl2000_stream_reprogram).
 	 * Without it the two sequences could interleave register writes; both run in process
 	 * context (atomic commit worker vs. watchdog workqueue), so a mutex is enough
 	 */
@@ -678,9 +679,9 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 
 	fl2000_stream_mode_set(drm_if->stream, mode->hdisplay * mode->vdisplay, bytes_pix);
 
-	/* Remember the working configuration so the streaming stall watchdog can
-	 * app-reset and reprogram the chip without a full modeset. mode_lock keeps this
-	 * snapshot consistent with a concurrent watchdog reprogram
+	/* Remember the working configuration so post_reset can reprogram the chip after a
+	 * USB device reset without a full modeset. mode_lock keeps this snapshot
+	 * consistent with a concurrent post_reset reprogram
 	 */
 	drm_if->last_pll = pll;
 	drm_if->last_timings = timings;
@@ -690,12 +691,11 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	mutex_unlock(&drm_if->mode_lock);
 }
 
-/* Chip reprogramming for the streaming stall watchdog's hard recovery: same register
- * sequence as fl2000_output_mode_set(), preceded by the streaming altsetting re-select
- * and followed by fl2000_usb_magic() - both required because the watchdog now recovers
- * with a full USB device reset, which restores altsetting 0 and wipes every register.
- * Control transfers with a bounded timeout, so it cannot hang even against a wedged
- * chip. Called from the watchdog's own workqueue.
+/* Chip reprogramming after a USB device reset: same register sequence as
+ * fl2000_output_mode_set(), preceded by the streaming altsetting re-select and followed by
+ * fl2000_usb_magic() - both required because the reset restores altsetting 0 and wipes every
+ * register. Control transfers with a bounded timeout, so it cannot hang even against a
+ * wedged chip. Called from fl2000_drm_post_reset(), i.e. the USB core's post_reset path.
  */
 static int fl2000_stream_reprogram(void *ctx)
 {
@@ -710,7 +710,7 @@ static int fl2000_stream_reprogram(void *ctx)
 		return -ENODEV;
 	}
 
-	dev_err(drm_if->drm.dev, "stream stall: app-reset and reprogramming chip mode");
+	dev_err(drm_if->drm.dev, "USB device reset: reprogramming chip mode");
 
 	ret = usb_set_interface(usb_dev, FL2000_USBIF_AVCONTROL, 1);
 	if (!ret)
@@ -875,9 +875,6 @@ int fl2000_drm_bind(struct device *master)
 		goto error;
 	}
 
-	/* Let the streaming stall watchdog reprogram the chip when bulk transfers wedge */
-	fl2000_stream_set_recovery(drm_if->stream, drm_if, fl2000_stream_reprogram);
-
 	/* Start interrupts interface */
 	drm_if->intr = fl2000_intr_create(usb_dev, drm);
 	if (IS_ERR(drm_if->intr)) {
@@ -1007,4 +1004,48 @@ int fl2000_drm_resume(struct device *master)
 	fl2000_intr_restart(drm_if->usb_dev);
 
 	return ret;
+}
+
+/* In-place USB device reset hooks, wired to the USB driver's pre_reset/post_reset.
+ *
+ * They exist because of a hard freeze (2026-09-10): usb_reset_device() calls
+ * usb_forced_unbind_intf() on every bound interface unless the driver provides BOTH
+ * pre_reset and post_reset. The forced unbind ran fl2000_disconnect() ->
+ * fl2000_drm_unbind() -> drm_atomic_helper_shutdown() -> fl2000_display_disable() ->
+ * fl2000_stream_disable() from inside the stall watchdog's own work item, and that
+ * function's cancel_delayed_work_sync(&watchdog_work) then waited on the work item
+ * currently executing it. The worker never returned, kept holding the USB device lock,
+ * blocked hub_event in usb_disconnect(), and the machine froze with no panic and no
+ * kdump. With both callbacks the reset is performed in place instead of force-unbinding.
+ */
+int fl2000_drm_pre_reset(struct device *master)
+{
+	struct fl2000_drm_if *drm_if = dev_get_drvdata(master);
+
+	if (!drm_if)
+		return 0;
+
+	/* No URB may be submitted while the device is being reset */
+	fl2000_stream_disable(drm_if->stream);
+
+	return 0;
+}
+
+int fl2000_drm_post_reset(struct device *master)
+{
+	struct fl2000_drm_if *drm_if = dev_get_drvdata(master);
+
+	if (!drm_if)
+		return 0;
+
+	/* The reset wiped every register and restored altsetting 0: reprogram the saved
+	 * mode and restart the interrupt URB the reset aborted. The streaming session
+	 * itself is re-kicked by the stall watchdog that requested the reset.
+	 */
+	if (drm_if->mode_config_valid)
+		fl2000_stream_reprogram(drm_if);
+
+	fl2000_intr_restart(drm_if->usb_dev);
+
+	return 0;
 }

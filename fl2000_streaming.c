@@ -99,12 +99,6 @@ struct fl2000_stream {
 	int last_urb_status;
 	unsigned int completion_count;
 	unsigned int error_count;
-	/* Chip reprogramming callback for hard recovery, registered by the DRM layer
-	 * which knows the current mode. Plain function pointer + ctx: the DRM device
-	 * outlives the stream (fl2000_drm_if_release destroys in that order)
-	 */
-	int (*reprogram)(void *ctx);
-	void *reprogram_ctx;
 };
 
 static void fl2000_free_sb(struct fl2000_stream_buf *sb)
@@ -201,6 +195,21 @@ error:
 	return ret;
 }
 
+/* Cancel the stall watchdog, but never wait on ourselves.
+ *
+ * When usb_reset_device() force-unbinds this driver from inside the watchdog's own work
+ * item, the unbind path calls fl2000_stream_disable()/fl2000_stream_release() right here.
+ * cancel_delayed_work_sync() would then block that worker on its own completion, pinning
+ * the USB device lock forever, stalling hub_event in usb_disconnect() and freezing the
+ * whole machine with no panic/kdump (2026-09-10). pre_reset/post_reset now keep the driver
+ * bound, but this guard keeps the teardown paths safe regardless of who calls them.
+ */
+static void fl2000_watchdog_cancel(struct fl2000_stream *stream)
+{
+	if (current_work() != &stream->watchdog_work.work)
+		cancel_delayed_work_sync(&stream->watchdog_work);
+}
+
 static void fl2000_stream_release(struct device *dev, void *res)
 {
 	struct fl2000_stream *stream = res;
@@ -209,7 +218,7 @@ static void fl2000_stream_release(struct device *dev, void *res)
 
 	if (!stream || IS_ERR(stream))
 		return;
-	cancel_delayed_work_sync(&stream->watchdog_work);
+	fl2000_watchdog_cancel(stream);
 	if (stream->work_queue) {
 		fl2000_stream_disable(stream);
 		destroy_workqueue(stream->work_queue);
@@ -514,9 +523,14 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		 * physical replug does - revives it. Do that in software.
 		 *
 		 * Park the transmit worker first: it must not submit URBs across the
-		 * reset (usb_submit_urb on a resetting device fails and would kill the
-		 * stream). The reset aborts every URB in flight and its givebacks
-		 * return all buffers to render_list.
+		 * reset. The reset itself is performed in place: the USB driver's
+		 * pre_reset/post_reset hooks keep this interface bound, and post_reset()
+		 * reprograms the chip and restarts the aborted interrupt URB (the session
+		 * is re-kicked below). Without both hooks usb_reset_device() force-unbinds
+		 * the interface, and its DRM shutdown runs synchronously inside this very
+		 * work item - fl2000_stream_disable() then waits on the watchdog work item
+		 * that is executing it (self-deadlock holding the USB device lock),
+		 * freezing the machine with no panic/kdump (2026-09-10).
 		 */
 		stream->enabled = false;
 		up(&stream->work_sem);
@@ -535,20 +549,9 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		if (ret)
 			goto rearm;
 
-		/* Reprogram the chip from its post-reset state: the reset restores
-		 * altsetting 0 and wipes every register, so the mode (PLL/timings/
-		 * pixfmt/transfers/interrupts/AFE/magic) must be written again, and
-		 * the interrupt URB (aborted by the reset) restarted.
-		 */
-		if (stream->reprogram && stream->reprogram(stream->reprogram_ctx))
-			dev_err(&stream->usb_dev->dev,
-				"chip reprogramming after device reset failed");
-
-		fl2000_intr_restart(stream->usb_dev);
-
-		/* Any URB still anchored here is a giveback straggler from the reset.
-		 * The device is healthy again, so they give back quickly; poison only
-		 * as a bounded fallback before the clean re-init.
+		/* post_reset() already reprogrammed the chip and restarted the aborted
+		 * interrupt URB. Drop any giveback straggler the reset left anchored,
+		 * then restart the streaming session.
 		 */
 		if (!usb_wait_anchor_empty_timeout(&stream->anchor, 1000)) {
 			usb_poison_anchored_urbs(&stream->anchor);
@@ -556,7 +559,6 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		}
 		init_usb_anchor(&stream->anchor);
 
-		/* Restart the streaming session */
 		sema_init(&stream->work_sem, 0);
 		stream->enabled = true;
 		stream->last_completion = jiffies;
@@ -778,7 +780,7 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 	/* Stop the watchdog first: it must not attempt recovery against a stream that is
 	 * being torn down (its 'enabled' check races a running iteration)
 	 */
-	cancel_delayed_work_sync(&stream->watchdog_work);
+	fl2000_watchdog_cancel(stream);
 
 	/* Unblock a worker parked on the semaphore so drain can complete; the worker checks
 	 * 'enabled' on wake and exits
@@ -877,15 +879,6 @@ struct fl2000_stream *fl2000_stream_create(struct usb_device *usb_dev, struct dr
 	}
 
 	return stream;
-}
-
-void fl2000_stream_set_recovery(struct fl2000_stream *stream, void *ctx,
-				int (*reprogram)(void *ctx))
-{
-	if (!stream || IS_ERR(stream))
-		return;
-	stream->reprogram = reprogram;
-	stream->reprogram_ctx = ctx;
 }
 
 void fl2000_stream_destroy(struct usb_device *usb_dev)

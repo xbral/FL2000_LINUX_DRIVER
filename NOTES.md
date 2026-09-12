@@ -1284,3 +1284,68 @@ Note for the kprobe technique: filter the `try_module_get`/`module_put`
 arguments with `m=$arg1` (not `%di`) and remember to clear the `stacktrace`
 trigger (`echo '!stacktrace' > events/kprobes/EV/trigger`) before deleting the
 probe, otherwise `kprobe_events` stays busy.
+
+## USB reset recovery self-deadlock froze the machine (2026-09-10, session 9)
+
+User report: "o monitor que está ligado pelo dongle usb desligou novamente e o
+computador todo travou" - and asked whether the PC or the monitor froze first.
+The driver was the cause: the monitor going black was the known stream wedge,
+but the *machine* freeze was the watchdog's own USB-reset recovery deadlocking on
+itself. Boot `ec273cfd` (Sep 9 18:12 - Sep 10 11:18), 1920x1080:
+
+    11:10:19  [CRTC:37:crtc-0] vblank wait timed out  (WARNING, kworker/u32:6)
+    11:10:20  stream stall, soft recovery 1
+    11:10:20  -EPROTO flood (5308 x -71 total)
+    11:10:21  stream stall, soft recovery 2 (last status -71)
+    11:10:22  stream stall persists, endpoint reset recovery 3
+    11:10:23  stream stall persists, USB device reset recovery 4
+    11:10:23  fl2000_usb 4-1:1.0: Unbinding FL2000 master   <- the trap
+    11:11:25  USB disconnect
+    11:12:33  INFO: task kworker/u32:6 blocked for more than 122 s
+              Workqueue: fl2000_stall fl2000_stream_watchdog
+              __flush_work <- cancel_delayed_work_sync <- fl2000_stream_disable
+              <- fl2000_display_disable <- drm_atomic_helper_shutdown
+              <- fl2000_drm_unbind <- fl2000_disconnect <- usb_unbind_interface
+              <- usb_forced_unbind_intf <- usb_reset_device <- fl2000_stream_watchdog
+    repeats 11:14:36 (245 s), 11:16:39 (368 s)
+    11:14:36  INFO: kworker/7:0 (usb_hub_wq hub_event) blocked in usb_disconnect ...
+              "blocked on a mutex likely owned by task kworker/u32:6"
+    11:18:26  last journal entry; hard freeze, no panic, no kdump
+    11:20:12  reboot
+
+Root cause: `usb_reset_device()` force-unbinds every bound interface whose driver
+does *not* provide both `pre_reset` and `post_reset` (`drivers/usb/core/hub.c`,
+the `unbind = ...` / `usb_forced_unbind_intf()` loop before the reset). The
+fl2000 USB driver provided neither, so recovery 4 - issued from *inside* the
+`fl2000_stream_watchdog` work item - synchronously ran
+`fl2000_disconnect -> fl2000_drm_unbind -> drm_atomic_helper_shutdown ->
+fl2000_display_disable -> fl2000_stream_disable`, and that last function's
+`cancel_delayed_work_sync(&stream->watchdog_work)` waited on the very work item
+executing it. The worker never returned, held `usb_dev->mutex`, and `hub_event`
+then blocked in `usb_disconnect()` on that mutex: the entire USB stack wedged and
+the machine hard-froze. (Even without the deadlock, the unbind would have freed
+`stream` via devres while the watchdog still used it - a use-after-free.)
+
+Fix:
+
+- **`pre_reset` / `post_reset` on `fl2000_driver`** (`fl2000_drv.c`,
+  `fl2000_drm.c`). Both callbacks are now present, so `usb_reset_device()` resets
+  the port *in place* instead of force-unbinding the interface. `pre_reset`
+  quiesces the stream (`fl2000_stream_disable`, only on AVCONTROL); `post_reset`
+  reprograms the chip from its wiped post-reset state (`fl2000_stream_reprogram`)
+  and restarts the aborted interrupt URB. The watchdog then drops giveback
+  stragglers and re-kicks the transmit session as before. Return 0 from both =
+  "no unbind/rebind needed".
+- **Self-cancel guard** (`fl2000_streaming.c`). `fl2000_watchdog_cancel()` skips
+  `cancel_delayed_work_sync(&watchdog_work)` when `current_work()` *is* the
+  watchdog, used by both `fl2000_stream_disable()` and `fl2000_stream_release()`.
+  Required because `pre_reset` disables the stream from within the watchdog
+  context; it also makes any future teardown path safe.
+- Removed the now-dead `fl2000_stream_set_recovery()` reprogram callback plumbing
+  (the DRM layer calls `fl2000_stream_reprogram()` directly from `post_reset`).
+
+Verification: next stall must show `USB device reset recovery` followed by the
+chip reprogram and `stream resumed` / fresh completions, with **no**
+`Unbinding FL2000 master` and no hung-task lines. A `usbfs`-initiated reset
+(rare here - the watchdog is the only caller) restores the hardware but leaves
+the stream off until the next modeset; the watchdog path is unaffected.

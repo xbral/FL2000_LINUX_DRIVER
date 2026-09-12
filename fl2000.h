@@ -166,8 +166,6 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 			    unsigned int width, unsigned int pitch);
 int fl2000_stream_enable(struct fl2000_stream *stream);
 void fl2000_stream_disable(struct fl2000_stream *stream);
-void fl2000_stream_set_recovery(struct fl2000_stream *stream, void *ctx,
-				int (*reprogram)(void *ctx));
 
 /* Interrupt polling task */
 struct fl2000_intr;
@@ -237,5 +235,13 @@ void fl2000_drm_unbind(struct device *master);
  */
 int fl2000_drm_suspend(struct device *master);
 int fl2000_drm_resume(struct device *master);
+
+/* In-place USB device reset hooks, wired to the USB driver's pre_reset/post_reset.
+ * Keeping both callbacks stops usb_reset_device() from force-unbinding the interface
+ * (whose DRM shutdown deadlocks inside the stall watchdog) and lets the reset be
+ * recovered in place. Defined in fl2000_drm.c
+ */
+int fl2000_drm_pre_reset(struct device *master);
+int fl2000_drm_post_reset(struct device *master);
 
 #endif /* __FL2000_DRM_H__ */
