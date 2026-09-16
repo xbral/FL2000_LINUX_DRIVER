@@ -1349,3 +1349,74 @@ chip reprogram and `stream resumed` / fresh completions, with **no**
 `Unbinding FL2000 master` and no hung-task lines. A `usbfs`-initiated reset
 (rare here - the watchdog is the only caller) restores the hardware but leaves
 the stream off until the next modeset; the watchdog path is unaffected.
+
+## Chip self-reset escapes the watchdog; the "logout" was a mutter crash (2026-09-16, session 10)
+
+User report: "depois de alguns dias funcionando normalmente, o monitor agora a
+pouco, apagou a tela e não voltou, quando retirei o usb e reconectei, ele fez
+logout na conta". Boot `e399581d` (Sep 15 18:36 - open), 1920x1080@60 RGB565,
+module loaded at boot. Two USB re-enumerations on `4-1`; the user confirmed the
+first one was NOT a physical unplug:
+
+    07:31:14       last clean modeset (1920x1080)
+    07:50:45.392   [CRTC:37:crtc-0] vblank wait timed out (WARNING, commit_work)
+    07:50:45.732   usb 4-1: USB disconnect, device number 2      <- +339 ms
+    07:50:45.734   usb 4-1: Data URB error -19
+    07:50:45.955   usb 4-1: new SuperSpeed USB device number 3   <- re-enumerated
+    07:50:45.992   [drm] Initialized fl2000_drm ... on minor 0   <- was minor 1
+    07:50:45       gnome-shell: drmModeRmFB: No such device /
+                   Zero-copy disabled for /dev/dri/card1, import failed /
+                   Failed to acquire front buffer: Missing secondary GPU framebuffer /
+                   Page flip failed: drmModeCreatePropertyBlob: No such device
+    08:00:55       usb 4-1: USB disconnect, device number 3      <- user unplug
+    08:00:57       usb 4-1: new SuperSpeed USB device number 4
+    08:00:57       gnome-shell: Failed to hotplug secondary gpu '/dev/dri/card0':
+                   device already present
+    08:00:58       gnome-shell: GNOME Shell crashed with signal 11 (SIGSEGV)
+    08:01:08       org.gnome.Shell@ubuntu.service: Failed with result 'core-dump'
+    08:01:08       session shutdown, logout; relogin modesets 1920x1080 again
+
+Not a driver regression, and the session-9 fix held:
+
+- `boot -2` (Sep 12 07:44 - Sep 15 18:35, ~3 days) ran this same module
+  (srcversion `89522E6B796C39ABFB45C5C`) with **zero** USB disconnects: the
+  "few days working" were genuinely clean.
+- The whole incident boot has no `stream stall` / `recovery` / `Unbinding` /
+  hung-task line and taint is only `OE`. The pre_reset/post_reset path did not
+  trigger and did not need to: the device left the bus before any watchdog rung
+  ran.
+
+Root cause of the black screen: the chip wedged its streaming engine and then
+**self-reset at the USB level** (disconnect + re-enumeration) 339 ms after the
+last successful completion. The host cannot prevent a device-initiated
+disconnect: the watchdog (`STALL_TIMEOUT` 250 ms, `WATCHDOG_PERIOD` 1 s) cannot
+fire inside that window, and even if it did, the recovery ladder takes ~4 s and
+a host `usb_reset_device()` against a chip that is already resetting also ends
+in re-enumeration. Re-registration landed on a **different DRM minor**
+(`card1` -> `card0`, freed by simpledrm when i915 took over), so mutter, which
+held `/dev/dri/card1`, lost its front buffer and left the output black.
+
+Root cause of the logout: mutter 50.1 SIGSEGV in its secondary-GPU hotplug path
+(`Failed to hotplug secondary gpu '/dev/dri/card0': device already present`),
+not the driver. systemd logged `org.gnome.Shell@ubuntu.service: Failed with
+result 'core-dump'` and tore the session down.
+
+Frequency: intermittent, seen before on this dongle (`boot -4`/`boot -5` had
+re-enumerations too; `boot -2` did not). The interval is wildly variable,
+matching the long-standing "streaming firmware crashes on some rare race"
+hypothesis from session 6.
+
+Where to go from here (no driver fix proposed):
+
+- Physical: test another USB-3 port (direct, no hub) or a powered hub. "Hours of
+  clean streaming, then the chip resets under bulk load" is also consistent with
+  a port power/brownout event, which the host driver cannot observe.
+- Mutter: the SIGSEGV on secondary-GPU hotplug is reproducible and is worth a
+  GNOME report, independent of fl2000.
+- Driver: a faster watchdog (100 ms) would most likely lose the 339 ms race and
+  risks resetting on transient hiccups; not worth it without a USB capture of
+  the wedge moment.
+
+Verification status: display recovered after the relogin (modeset at 08:01:08);
+the machine did NOT freeze and there was no fault in fl2000 - this incident is
+entirely outside the driver's reach.
