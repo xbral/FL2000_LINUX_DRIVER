@@ -199,7 +199,7 @@ int fl2000_connector_sense(struct usb_device *usb_dev);
 int fl2000_ddc_detect_enable_staged(struct usb_device *usb_dev);
 int fl2000_ddc_step_aclk(struct usb_device *usb_dev);
 int fl2000_ddc_step_modeset(struct usb_device *usb_dev);
-void fl2000_log_vga_status(struct usb_device *usb_dev);
+int fl2000_log_vga_status(struct usb_device *usb_dev);
 void fl2000_dump_regs(struct usb_device *usb_dev);
 int fl2000_enable_interrupts(struct usb_device *usb_dev);
 int fl2000_check_interrupt(struct usb_device *usb_dev);

@@ -518,6 +518,15 @@ static void fl2000_display_enable(struct drm_simple_display_pipe *pipe,
 	UNUSED(cstate);
 	UNUSED(plane_state);
 
+	/* The stall watchdog is armed here and nowhere else, so this log is what
+	 * distinguishes "the watchdog never ran" from "the watchdog ran and died":
+	 * without it a black screen with no watchdog thread is indistinguishable
+	 * from a black screen whose atomic commit never reached this point
+	 * (incident 2026-10-28: the CRTC was active, the mode was configured, and
+	 * no fl2000_stall worker existed anywhere in /proc).
+	 */
+	dev_info(drm->dev, "display enable: arming the stream");
+
 	fl2000_stream_enable(drm_if->stream);
 
 	drm_crtc_vblank_on(crtc);
@@ -528,6 +537,8 @@ static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
 	struct drm_crtc *crtc = &pipe->crtc;
 	struct drm_device *drm = pipe->crtc.dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
+
+	dev_info(drm->dev, "display disable: stopping the stream");
 
 	/* Vblanks on this device ARE stream URB completions, so they stop the moment the
 	 * stream does (and never come at all after hot-unplug). Turn vblanks off first: it
@@ -696,11 +707,20 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
  * fl2000_usb_magic() - both required because the reset restores altsetting 0 and wipes every
  * register. Control transfers with a bounded timeout, so it cannot hang even against a
  * wedged chip. Called from fl2000_drm_post_reset(), i.e. the USB core's post_reset path.
+ *
+ * Every step is named on failure. The whole sequence used to be one dev_err() printed
+ * *before* any register was touched, and the post_reset caller threw the return value away,
+ * so a run that died on the very first usb_set_interface() was indistinguishable in dmesg
+ * from one that programmed the chip perfectly: "USB device reset: reprogramming chip mode"
+ * was simply the last line the driver ever printed (incident 2026-10-16 09:33). "Which
+ * register write did not answer" is the whole difference between blaming the chip and
+ * blaming this code.
  */
 static int fl2000_stream_reprogram(void *ctx)
 {
 	struct fl2000_drm_if *drm_if = ctx;
 	struct usb_device *usb_dev = drm_if->usb_dev;
+	const char *step;
 	int ret;
 
 	mutex_lock(&drm_if->mode_lock);
@@ -712,23 +732,64 @@ static int fl2000_stream_reprogram(void *ctx)
 
 	dev_err(drm_if->drm.dev, "USB device reset: reprogramming chip mode");
 
+	step = "select streaming altsetting";
 	ret = usb_set_interface(usb_dev, FL2000_USBIF_AVCONTROL, 1);
-	if (!ret)
-		ret = fl2000_set_pll(usb_dev, &drm_if->last_pll);
-	if (!ret)
-		ret = fl2000_reset(usb_dev);
-	if (!ret)
-		ret = fl2000_set_timings(usb_dev, &drm_if->last_timings);
-	if (!ret)
-		ret = fl2000_set_pixfmt(usb_dev, drm_if->last_bytes_pix);
-	if (!ret)
-		ret = fl2000_set_transfers(usb_dev);
-	if (!ret)
-		ret = fl2000_enable_interrupts(usb_dev);
-	if (!ret)
-		ret = fl2000_afe_magic(usb_dev);
-	if (!ret)
-		ret = fl2000_usb_magic(usb_dev);
+	if (ret)
+		goto failed;
+
+	step = "set PLL";
+	ret = fl2000_set_pll(usb_dev, &drm_if->last_pll);
+	if (ret)
+		goto failed;
+
+	step = "chip reset";
+	ret = fl2000_reset(usb_dev);
+	if (ret)
+		goto failed;
+
+	step = "set timings";
+	ret = fl2000_set_timings(usb_dev, &drm_if->last_timings);
+	if (ret)
+		goto failed;
+
+	step = "set pixel format";
+	ret = fl2000_set_pixfmt(usb_dev, drm_if->last_bytes_pix);
+	if (ret)
+		goto failed;
+
+	step = "set transfers";
+	ret = fl2000_set_transfers(usb_dev);
+	if (ret)
+		goto failed;
+
+	step = "enable interrupts";
+	ret = fl2000_enable_interrupts(usb_dev);
+	if (ret)
+		goto failed;
+
+	step = "AFE magic";
+	ret = fl2000_afe_magic(usb_dev);
+	if (ret)
+		goto failed;
+
+	step = "USB magic";
+	ret = fl2000_usb_magic(usb_dev);
+	if (ret)
+		goto failed;
+
+	dev_err(drm_if->drm.dev,
+		"chip reprogram OK: %ux%u at %u bytes/px, streaming restart is up to the stall watchdog",
+		drm_if->last_timings.hactive, drm_if->last_timings.vactive,
+		drm_if->last_bytes_pix);
+
+	mutex_unlock(&drm_if->mode_lock);
+
+	return 0;
+
+failed:
+	dev_err(drm_if->drm.dev,
+		"chip reprogram FAILED (%d) at \"%s\": registers left as the reset found them, display stays black until a replug",
+		ret, step);
 
 	mutex_unlock(&drm_if->mode_lock);
 
@@ -836,10 +897,26 @@ int fl2000_drm_bind(struct device *master)
 		goto error;
 	}
 
-	/* On a VGA dongle there is no bridge chip, so stand up our own connector for the chip's
-	 * integrated DAC and hand it to the pipe. Must happen before the pipe is initialised,
-	 * which is what attaches the connector to the encoder
-	 */
+/* Pinned connector name.
+ *
+ * Left to itself the kernel builds the name as "<TYPE>-<id>" where the id comes from
+ * connector_ida, an IDA shared by *every* DRM device on the machine, allocated with
+ * ida_alloc_min(). The number is therefore just the lowest free slot at bind time, and
+ * it moves as other devices come and go: this dongle has been VGA-1, VGA-2, VGA-3, VGA-4
+ * and VGA-5 on this machine across re-enumerations.
+ *
+ * That matters because Mutter identifies a monitor by (connector name, vendor, product,
+ * serial) and stores its layout under that key in ~/.config/monitors.xml. Every login
+ * that lands on a different number silently fails to match the stored layout, so the
+ * connector comes up connected but disabled and the display stays black until the config
+ * is reapplied by hand. A fixed name makes the key stable.
+ */
+#define FL2000_VGA_CONNECTOR_NAME "VGA-1"
+
+/* On a VGA dongle there is no bridge chip, so stand up our own connector for the chip's
+ * integrated DAC and hand it to the pipe. Must happen before the pipe is initialised,
+ * which is what attaches the connector to the encoder
+ */
 	if (fl2000_vga_mode) {
 		drm_connector_helper_add(&drm_if->connector, &fl2000_connector_helper_funcs);
 
@@ -852,6 +929,24 @@ int fl2000_drm_bind(struct device *master)
 		if (ret) {
 			dev_err(drm->dev, "Cannot initialize VGA connector (%d)", ret);
 			goto error;
+		}
+
+		/* Pin the name drm_connector_init() just generated. It is freed with
+		 * kfree() by drm_connector_cleanup(), so kfree/kstrdup is the pairing
+		 * this needs
+		 */
+		if (strcmp(drm_if->connector.name, FL2000_VGA_CONNECTOR_NAME)) {
+			dev_info(drm->dev, "VGA connector: kernel named it %s, pinning to %s",
+				 drm_if->connector.name, FL2000_VGA_CONNECTOR_NAME);
+
+			kfree(drm_if->connector.name);
+			drm_if->connector.name = kstrdup(FL2000_VGA_CONNECTOR_NAME,
+							GFP_KERNEL);
+			if (!drm_if->connector.name) {
+				dev_err(drm->dev, "Cannot pin VGA connector name");
+				ret = -ENOMEM;
+				goto error;
+			}
 		}
 	}
 

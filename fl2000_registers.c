@@ -297,7 +297,12 @@ int fl2000_ddc_detect_enable_staged(struct usb_device *usb_dev)
  * driver's struct vga_status (fl2000_interrupt.h); bit 0 is the overall connect status that
  * gates the reference driver's EDID read
  */
-void fl2000_log_vga_status(struct usb_device *usb_dev)
+/* Returns the regmap result: 0 when the register was read, the negative errno otherwise.
+ * A failure here is itself the useful signal - the bulk endpoint is already dead, so a
+ * control transfer failing too means the failure is at the USB/chip level rather than a
+ * starved endpoint. The stall watchdog uses that to pick a recovery rung.
+ */
+int fl2000_log_vga_status(struct usb_device *usb_dev)
 {
 	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
 	union fl2000_vga_status_reg status;
@@ -306,13 +311,15 @@ void fl2000_log_vga_status(struct usb_device *usb_dev)
 	ret = regmap_read(regmap, FL2000_VGA_STATUS_REG, &status.val);
 	if (ret) {
 		dev_err(&usb_dev->dev, "VGA status read failed (%d)", ret);
-		return;
+		return ret;
 	}
 
 	dev_info(&usb_dev->dev,
 		 "VGA status 0x%08x: connected %u edid_connected %u ext_mon_connected %u pll_up %u dac_up %u",
 		 status.val, status.vga_status, status.edid_status, status.monitor_status,
 		 status.pll_status, status.dac_status);
+
+	return 0;
 }
 
 /* Raw dump of the VGA register block plus the two USB-block registers the drivers touch. Uses
@@ -500,7 +507,16 @@ int fl2000_check_interrupt(struct usb_device *usb_dev)
 		fl2000_add_bitmask(mask, union fl2000_vga_status_reg, lbuf_overflow);
 	if (status.lbuf_underflow)
 		fl2000_add_bitmask(mask, union fl2000_vga_status_reg, lbuf_underflow);
-	regmap_write_bits(regmap, FL2000_VGA_STATUS_REG, mask, status.val);
+
+	/* Only write when there is actually a bit to clear. With mask == 0 the write
+	 * changes nothing, but it is still a full USB control transfer - and this runs
+	 * on every single interrupt poll (the chip's bInterval is 7, i.e. every 8 ms,
+	 * so 125 times a second), forever, on the same xHCI controller the Bluetooth
+	 * dongle is attached to. Half of the driver's constant control traffic was
+	 * this no-op write.
+	 */
+	if (mask)
+		regmap_write_bits(regmap, FL2000_VGA_STATUS_REG, mask, status.val);
 
 	/* TODO: Reset LBUF using regmap_field if (status.lbuf_halt) */
 

@@ -149,6 +149,12 @@ struct fl2000_intr *fl2000_intr_create(struct usb_device *usb_dev, struct drm_de
 	}
 	devres_add(&usb_dev->dev, intr);
 
+	/* devres_alloc() is kmalloc() - not zeroed. See the long comment in
+	 * fl2000_stream_create(): the kernel's INIT_WORK/INIT_DELAYED_WORK contract
+	 * is "zero initialization followed by setting the function pointer".
+	 */
+	memset(intr, 0, sizeof(*intr));
+
 	intr->poll_interval = desc->bInterval;
 	intr->usb_dev = usb_dev;
 	intr->drm = drm;

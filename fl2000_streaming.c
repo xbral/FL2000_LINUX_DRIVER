@@ -57,6 +57,15 @@
  *        it. After the reset the chip is reprogrammed from scratch and the
  *        stream restarted.
  *   6    give up: only a physical replug revives the display
+ *
+ * Climbing that ladder costs one FL2000_WATCHDOG_PERIOD tick per rung, so the hard reset
+ * is ~3.25 s behind the stall. When the chip is going to drop off the bus anyway that is
+ * far too late: the re-enumeration changes the DRM minor, which is what leaves the
+ * compositor holding a stale output and the display black until the session restarts.
+ * The observed signature of that case (2026-10-09) is a failing VGA status read in the
+ * very same tick as the stall - the bulk endpoint is dead and a control transfer fails
+ * too, ~350 ms before "USB disconnect". So rung 1 escalates straight to the hard reset
+ * on that signal, same work item, before the chip can leave the bus.
  */
 #define FL2000_STALL_TIMEOUT msecs_to_jiffies(250)
 #define FL2000_WATCHDOG_PERIOD msecs_to_jiffies(1000)
@@ -64,9 +73,40 @@
 #define FL2000_STALL_EP_TRIES 1
 #define FL2000_STALL_RESET_TRIES 2
 
+/* Size of the chunk a frame is split into, in KB. 0 = one URB per frame (the
+ * old behaviour).
+ *
+ * Why split at all: the dongle pushes a whole 1080p frame as ONE 4,15 MB bulk
+ * transfer, which on a 5 Gbps link is 6,6 ms of *continuous* bulk with no gap
+ * for the controller to service anybody else. The Bluetooth dongle is a
+ * full-speed USB 2.0 device on the USB2 companion bus of the SAME xHCI
+ * controller, and its transfers are queued behind that burst: measured with
+ * the dongle streaming, 38% of the mouse reports reached the input layer more
+ * than 100 ms late - up to 3,6 s late. With the dongle idle, 100% of the
+ * reports arrived within 5 ms of their HCI packet.
+ *
+ * Splitting the frame into ~1 MB chunks makes the burst 4x shorter and lets
+ * the controller interleave the Bluetooth transfers in between. The byte
+ * stream the chip sees is unchanged - the chunks go out back to back, in
+ * order, and only the last one carries the ZLP that closes the frame.
+ */
+static int fl2000_chunk_kb = 1024;
+module_param(fl2000_chunk_kb, int, 0644);
+MODULE_PARM_DESC(fl2000_chunk_kb,
+		 "Size in KB of each bulk chunk a frame is split into (0 = one URB per frame)");
+
+#define FL2000_CHUNK_BYTES ((size_t)fl2000_chunk_kb * 1024)
+
 struct fl2000_stream_buf {
 	struct list_head list;
-	struct sg_table sgt;
+	/* One scatterlist table per chunk. With chunking disabled there is a
+	 * single table covering the whole frame, exactly as before.
+	 */
+	struct sg_table *chunk_sgt;
+	unsigned int n_chunks;
+	unsigned int chunk_bytes;	/* bytes per chunk, last one may be shorter */
+	unsigned int chunk_next;	/* next chunk to submit */
+	unsigned int chunk_done;	/* chunks completed */
 	struct page **pages;
 	unsigned int nr_pages;
 	void *vaddr;
@@ -87,9 +127,29 @@ struct fl2000_stream {
 	struct semaphore work_sem;
 	bool enabled;
 	struct usb_anchor anchor;
+	/* Chunks of the frame currently being sent, in flight. Counted in
+	 * chunks, not frames: this is what limits how much bulk data the
+	 * controller is holding for us at any time.
+	 */
+	atomic_t chunks_inflight;
+	/* The frame whose chunks are being sent. The chunks of one frame must
+	 * reach the chip in order, so the frame is kept here until all of its
+	 * chunks are out; only then the next frame starts.
+	 */
+	struct fl2000_stream_buf *cur_buf;
 	/* Stall watchdog state, see FL2000_STALL_* above */
 	struct delayed_work watchdog_work;
 	struct workqueue_struct *watchdog_wq;
+	/* True while the watchdog is supposed to be running. 'enabled' alone is not
+	 * enough: the reset path clears 'enabled' transiently (pre_reset ->
+	 * fl2000_stream_disable) and the watchdog must survive that, but a teardown
+	 * must stop it for good. Without this distinction a tick cannot tell "come
+	 * back later" from "you are done", and 1.0.5 chose wrong: it re-armed
+	 * forever after a disable, and the watchdog never came back at all when it
+	 * should have (incident 2026-10-28).
+	 */
+	bool watchdog_armed;
+	unsigned int watchdog_ticks;
 	unsigned long last_completion;
 	unsigned int stall_recoveries;
 	bool gave_up;
@@ -105,7 +165,10 @@ static void fl2000_free_sb(struct fl2000_stream_buf *sb)
 {
 	vunmap(sb->vaddr);
 
-	sg_free_table(&sb->sgt);
+	for (unsigned int i = 0; i < sb->n_chunks; i++)
+		sg_free_table(&sb->chunk_sgt[i]);
+
+	kfree(sb->chunk_sgt);
 
 	for (int i = 0; i < sb->nr_pages && sb->pages[i]; i++)
 		__free_page(sb->pages[i]);
@@ -113,6 +176,47 @@ static void fl2000_free_sb(struct fl2000_stream_buf *sb)
 	kfree(sb->pages);
 
 	kfree(sb);
+}
+
+/* Builds the per-chunk scatterlist tables. A chunk always starts on a page
+ * boundary (the chunk size is a multiple of PAGE_SIZE), so the offset within
+ * the first page is always zero and the last chunk is simply shorter.
+ */
+static int fl2000_alloc_chunk_sgts(struct fl2000_stream_buf *sb, unsigned int size)
+{
+	unsigned int chunk_bytes = FL2000_CHUNK_BYTES;
+	unsigned int pages_per_chunk;
+	unsigned int n_chunks;
+	int ret;
+
+	if (!chunk_bytes)
+		chunk_bytes = size;	/* chunking disabled: one chunk = one frame */
+
+	n_chunks = DIV_ROUND_UP(size, chunk_bytes);
+	pages_per_chunk = PAGE_ALIGN(chunk_bytes) >> PAGE_SHIFT;
+
+	sb->chunk_sgt = kcalloc(n_chunks, sizeof(struct sg_table), GFP_KERNEL);
+	if (!sb->chunk_sgt)
+		return -ENOMEM;
+
+	for (unsigned int k = 0; k < n_chunks; k++) {
+		unsigned int off = k * chunk_bytes;
+		unsigned int first_page = off >> PAGE_SHIFT;
+		unsigned int npages = min_t(unsigned int, pages_per_chunk,
+					    sb->nr_pages - first_page);
+		unsigned int nbytes = min_t(unsigned int, chunk_bytes, size - off);
+
+		ret = sg_alloc_table_from_pages(&sb->chunk_sgt[k],
+						 sb->pages + first_page, npages,
+						 0, nbytes, GFP_KERNEL);
+		if (ret)
+			return ret;
+		sb->n_chunks++;
+	}
+
+	sb->chunk_bytes = chunk_bytes;
+
+	return 0;
 }
 
 static struct fl2000_stream_buf *fl2000_alloc_sb(unsigned int size)
@@ -137,8 +241,8 @@ static struct fl2000_stream_buf *fl2000_alloc_sb(unsigned int size)
 			goto error;
 	}
 
-	ret = sg_alloc_table_from_pages(&sb->sgt, sb->pages, nr_pages, 0, size, GFP_KERNEL);
-	if (ret != 0)
+	ret = fl2000_alloc_chunk_sgts(sb, size);
+	if (ret)
 		goto error;
 
 	sb->vaddr = vmap(sb->pages, nr_pages, VM_MAP, PAGE_KERNEL);
@@ -160,6 +264,8 @@ static void fl2000_stream_put_buffers(struct fl2000_stream *stream)
 {
 	struct fl2000_stream_buf *cur_sb;
 	struct fl2000_stream_buf *temp_sb;
+
+	stream->cur_buf = NULL;
 
 	list_for_each_entry_safe(cur_sb, temp_sb, &stream->render_list, list) {
 		list_del(&cur_sb->list);
@@ -206,8 +312,13 @@ error:
  */
 static void fl2000_watchdog_cancel(struct fl2000_stream *stream)
 {
-	if (current_work() != &stream->watchdog_work.work)
-		cancel_delayed_work_sync(&stream->watchdog_work);
+	if (current_work() == &stream->watchdog_work.work)
+		return;
+
+	stream->watchdog_armed = false;
+	cancel_delayed_work_sync(&stream->watchdog_work);
+
+	dev_info(&stream->usb_dev->dev, "stall watchdog cancelled");
 }
 
 static void fl2000_stream_release(struct device *dev, void *res)
@@ -236,6 +347,7 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	struct fl2000_stream_buf *cur_sb = urb->transfer_buffer;
 	struct usb_device *usb_dev = urb->dev;
 	struct fl2000_stream *stream = urb->context;
+	bool frame_done = false;
 
 	/* Desancora primeiro: sem isso a âncora acumulava todos os URBs já
 	 * completados (leak) e usb_wait_anchor_empty_timeout() no disable
@@ -248,9 +360,21 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	if (stream) {
 		unsigned long flags;
 
-		spin_lock_irqsave(&stream->list_lock, flags);
-		list_move_tail(&cur_sb->list, &stream->render_list);
-		spin_unlock_irqrestore(&stream->list_lock, flags);
+		/* Um frame pode ter sido dividido em varios chunks. O buffer só
+		 * volta para a lista de render - e o vblank só é gerado - quando
+		 * o ULTIMO chunk completa: antes disso o chip ainda está
+		 * consumindo este frame.
+		 */
+		cur_sb->chunk_done++;
+		atomic_dec(&stream->chunks_inflight);
+
+		if (cur_sb->chunk_done >= cur_sb->n_chunks) {
+			frame_done = true;
+
+			spin_lock_irqsave(&stream->list_lock, flags);
+			list_move_tail(&cur_sb->list, &stream->render_list);
+			spin_unlock_irqrestore(&stream->list_lock, flags);
+		}
 
 		/* Only a SUCCESSFUL completion proves the pipeline is delivering pixels.
 		 * Error completions (e.g. an -EPROTO flood while the chip's streaming
@@ -267,7 +391,8 @@ static void fl2000_stream_data_completion(struct urb *urb)
 		if (urb->status)
 			stream->error_count++;
 
-		drm_crtc_handle_vblank(stream->crtc);
+		if (frame_done)
+			drm_crtc_handle_vblank(stream->crtc);
 
 		/* Kick transmit workqueue */
 		up(&stream->work_sem);
@@ -278,6 +403,81 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	usb_free_urb(urb);
 }
 
+/* Escolhe o proximo frame a enviar: um buffer ja pronto (transmit_list) ou,
+ * se nao houver, um buffer livre com uma copia do ultimo frame enviado, para
+ * que o stream continue mesmo sem damage do compositor. O buffer entra na
+ * wait_list (frames em voo) e volta para a render_list quando o ULTIMO chunk
+ * completa.
+ */
+static struct fl2000_stream_buf *fl2000_stream_take_buffer(struct fl2000_stream *stream)
+{
+	struct fl2000_stream_buf *cur_sb;
+	struct fl2000_stream_buf *last_sb = NULL;
+	unsigned long flags;
+	bool need_copy;
+	size_t copy_size = 0;
+
+	spin_lock_irqsave(&stream->list_lock, flags);
+
+	/* If no buffers are available for immediate transmission - then copy latest
+	 * transmission data. Toma posse do buffer (list_del) e faz o memcpy
+	 * SEM lock e COM irqs ligadas: o memcpy de 4 MB sob spinlock com
+	 * irqsave era a causa das travadas system-wide (ms com IRQs off).
+	 */
+	if (list_empty(&stream->transmit_list)) {
+		if (list_empty(&stream->render_list)) {
+			/* Backpressure: USB mais lento que o compositor.
+			 * Antes era BUG_ON; agora só perde esse tick.
+			 */
+			spin_unlock_irqrestore(&stream->list_lock, flags);
+			return NULL;
+		}
+		if (list_empty(&stream->wait_list))
+			last_sb = list_last_entry(&stream->render_list,
+						  struct fl2000_stream_buf, list);
+		else
+			last_sb = list_last_entry(&stream->wait_list,
+						  struct fl2000_stream_buf, list);
+		cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf,
+					  list);
+		list_del(&cur_sb->list);
+		need_copy = true;
+		copy_size = stream->buf_size;
+	} else {
+		cur_sb = list_first_entry(&stream->transmit_list, struct fl2000_stream_buf,
+					  list);
+		list_del(&cur_sb->list);
+		need_copy = false;
+	}
+
+	spin_unlock_irqrestore(&stream->list_lock, flags);
+
+	if (need_copy) {
+		/* Fonte continua válida: buffers só são liberados com
+		 * stream parado (disable espera este worker). No pior
+		 * caso, um completion move a fonte de lista no meio da
+		 * cópia e um frame sai com tear — benigno perto de
+		 * travar a máquina com IRQ off.
+		 */
+		if (last_sb && last_sb != cur_sb)
+			memcpy(cur_sb->vaddr, last_sb->vaddr, copy_size);
+	}
+
+	spin_lock_irqsave(&stream->list_lock, flags);
+	if (!stream->enabled) {
+		list_add_tail(&cur_sb->list, &stream->render_list);
+		spin_unlock_irqrestore(&stream->list_lock, flags);
+		return NULL;
+	}
+	list_add_tail(&cur_sb->list, &stream->wait_list);
+	spin_unlock_irqrestore(&stream->list_lock, flags);
+
+	cur_sb->chunk_next = 0;
+	cur_sb->chunk_done = 0;
+
+	return cur_sb;
+}
+
 /* TODO: convert to tasklet */
 static void fl2000_stream_work(struct work_struct *work)
 {
@@ -285,10 +485,7 @@ static void fl2000_stream_work(struct work_struct *work)
 	struct fl2000_stream *stream = container_of(work, struct fl2000_stream, work);
 	struct usb_device *usb_dev = stream->usb_dev;
 	struct fl2000_stream_buf *cur_sb;
-	struct fl2000_stream_buf *last_sb = NULL;
 	struct urb *data_urb;
-	bool need_copy;
-	size_t copy_size;
 
 	/* Streaming é bulk contínuo a 60fps: não compete com a UI. Roda com
 	 * nice +5 para o compositor continuar fluido sob carga (Hybris/IDE).
@@ -296,10 +493,6 @@ static void fl2000_stream_work(struct work_struct *work)
 	set_user_nice(current, 5);
 
 	while (stream->enabled) {
-		unsigned long flags;
-		unsigned int inflight = 0;
-		struct fl2000_stream_buf *tmp;
-
 		ret = down_interruptible(&stream->work_sem);
 		if (ret) {
 			dev_err(&usb_dev->dev, "Work interrupt error %d", ret);
@@ -317,115 +510,182 @@ static void fl2000_stream_work(struct work_struct *work)
 		if (!stream->enabled)
 			return;
 
-		spin_lock_irqsave(&stream->list_lock, flags);
-
-		/* Throttle: conta URBs em voo (wait_list). Se já temos o bastante,
-		 * devolve o buffer e espera o próximo completion (que dá up no sem).
-		 * Sem isso o enable dava kick de 3 frames de 4 MB de uma vez.
+		/* Envia chunks até o tubo encher.
+		 *
+		 * Os chunks de um frame precisam chegar ao chip em ordem, então o
+		 * frame em curso fica em stream->cur_buf até que todos os seus
+		 * chunks tenham saído; só depois começa o próximo frame. Com o
+		 * chunking desligado (n_chunks == 1) isto é exatamente o
+		 * comportamento antigo: um URB por frame.
+		 *
+		 * O throttle conta CHUNKS em voo, não frames: é o que limita
+		 * quantos bytes o controlador está guardando para nós de uma vez.
 		 */
-		list_for_each_entry(tmp, &stream->wait_list, list) {
-			if (++inflight >= FL2000_MAX_INFLIGHT)
-				break;
-		}
-		if (inflight >= FL2000_MAX_INFLIGHT) {
-			spin_unlock_irqrestore(&stream->list_lock, flags);
-			continue;
-		}
+		while (atomic_read(&stream->chunks_inflight) < FL2000_MAX_INFLIGHT) {
+			unsigned int idx;
+			unsigned int len;
 
-		/* If no buffers are available for immediate transmission - then copy latest
-		 * transmission data. Toma posse do buffer (list_del) e faz o memcpy
-		 * SEM lock e COM irqs ligadas: o memcpy de 4 MB sob spinlock com
-		 * irqsave era a causa das travadas system-wide (ms com IRQs off).
-		 */
-		if (list_empty(&stream->transmit_list)) {
-			if (list_empty(&stream->render_list)) {
-				/* Backpressure: USB mais lento que o compositor.
-				 * Antes era BUG_ON; agora só perde esse tick.
+			cur_sb = stream->cur_buf;
+			if (!cur_sb || cur_sb->chunk_next >= cur_sb->n_chunks) {
+				cur_sb = fl2000_stream_take_buffer(stream);
+				if (!cur_sb)
+					break;
+				stream->cur_buf = cur_sb;
+			}
+
+			idx = cur_sb->chunk_next;
+			len = cur_sb->chunk_bytes;
+			if ((size_t)(idx + 1) * len > stream->buf_size)
+				len = (unsigned int)(stream->buf_size - (size_t)idx * len);
+
+			data_urb = usb_alloc_urb(0, GFP_KERNEL);
+			if (!data_urb) {
+				dev_err(&usb_dev->dev, "Data URB allocation error");
+				stream->enabled = false;
+				return;
+			}
+
+			/* Endpoint 1 bulk out. We store pointer to current stream buffer structure in
+			 * transfer_buffer field of URB which is unused due to SGT
+			 */
+			usb_fill_bulk_urb(data_urb, usb_dev, usb_sndbulkpipe(usb_dev, 1), cur_sb,
+					  (int)len, fl2000_stream_data_completion, stream);
+			data_urb->interval = 0;
+			data_urb->sg = cur_sb->chunk_sgt[idx].sgl;
+			data_urb->num_sgs = cur_sb->chunk_sgt[idx].nents;
+			/* Só o ÚLTIMO chunk do frame leva o ZLP: é ele que fecha o frame
+			 * para o chip. Um ZLP no meio seria lido como fim de frame.
+			 */
+			if (idx + 1 >= cur_sb->n_chunks)
+				data_urb->transfer_flags |= URB_ZERO_PACKET;
+
+			usb_anchor_urb(data_urb, &stream->anchor);
+			ret = fl2000_submit_urb(data_urb, GFP_KERNEL);
+			if (ret) {
+				dev_err(&usb_dev->dev, "Data URB error %d", ret);
+				/* Must unanchor before dropping the reference: a failed-submit URB left
+				 * in the anchor is never completed and never given back, and teardown's
+				 * kill loop chokes on it - observed as a kworker live-spinning in
+				 * usb_kill_anchored_urbs() inside disconnect for tens of minutes while
+				 * holding the USB device mutex, wedging the whole port
 				 */
-				spin_unlock_irqrestore(&stream->list_lock, flags);
-				continue;
+				usb_unanchor_urb(data_urb);
+				usb_free_urb(data_urb);
+				stream->enabled = false;
+				break;
 			}
-			if (list_empty(&stream->wait_list))
-				last_sb = list_last_entry(&stream->render_list,
-							  struct fl2000_stream_buf, list);
-			else
-				last_sb = list_last_entry(&stream->wait_list,
-							  struct fl2000_stream_buf, list);
-			cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf,
-						  list);
-			list_del(&cur_sb->list);
-			need_copy = true;
-			copy_size = stream->buf_size;
-		} else {
-			cur_sb = list_first_entry(&stream->transmit_list, struct fl2000_stream_buf,
-						  list);
-			list_del(&cur_sb->list);
-			need_copy = false;
-			copy_size = 0;
-		}
-		spin_unlock_irqrestore(&stream->list_lock, flags);
 
-		if (need_copy) {
-			/* Fonte continua válida: buffers só são liberados com
-			 * stream parado (disable espera este worker). No pior
-			 * caso, um completion move a fonte de lista no meio da
-			 * cópia e um frame sai com tear — benigno perto de
-			 * travar a máquina com IRQ off.
-			 */
-			if (last_sb && last_sb != cur_sb)
-				memcpy(cur_sb->vaddr, last_sb->vaddr, copy_size);
-
-			spin_lock_irqsave(&stream->list_lock, flags);
-			if (!stream->enabled) {
-				list_add_tail(&cur_sb->list, &stream->render_list);
-				spin_unlock_irqrestore(&stream->list_lock, flags);
-				return;
-			}
-			list_add_tail(&cur_sb->list, &stream->wait_list);
-			spin_unlock_irqrestore(&stream->list_lock, flags);
-		} else {
-			spin_lock_irqsave(&stream->list_lock, flags);
-			if (!stream->enabled) {
-				list_add_tail(&cur_sb->list, &stream->render_list);
-				spin_unlock_irqrestore(&stream->list_lock, flags);
-				return;
-			}
-			list_add_tail(&cur_sb->list, &stream->wait_list);
-			spin_unlock_irqrestore(&stream->list_lock, flags);
-		}
-
-		data_urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!data_urb) {
-			dev_err(&usb_dev->dev, "Data URB allocation error");
-			stream->enabled = false;
-			return;
-		}
-
-		/* Endpoint 1 bulk out. We store pointer to current stream buffer structure in
-		 * transfer_buffer field of URB which is unused due to SGT
-		 */
-		usb_fill_bulk_urb(data_urb, usb_dev, usb_sndbulkpipe(usb_dev, 1), cur_sb,
-				  (int)stream->buf_size, fl2000_stream_data_completion, stream);
-		data_urb->interval = 0;
-		data_urb->sg = cur_sb->sgt.sgl;
-		data_urb->num_sgs = cur_sb->sgt.nents;
-		data_urb->transfer_flags |= URB_ZERO_PACKET;
-
-		usb_anchor_urb(data_urb, &stream->anchor);
-		ret = fl2000_submit_urb(data_urb, GFP_KERNEL);
-		if (ret) {
-			dev_err(&usb_dev->dev, "Data URB error %d", ret);
-			/* Must unanchor before dropping the reference: a failed-submit URB left
-			 * in the anchor is never completed and never given back, and teardown's
-			 * kill loop chokes on it - observed as a kworker live-spinning in
-			 * usb_kill_anchored_urbs() inside disconnect for tens of minutes while
-			 * holding the USB device mutex, wedging the whole port
-			 */
-			usb_unanchor_urb(data_urb);
-			usb_free_urb(data_urb);
-			stream->enabled = false;
+			cur_sb->chunk_next++;
+			atomic_inc(&stream->chunks_inflight);
 		}
 	}
+}
+
+/* Full in-place USB device reset, the recovery that actually revives a wedged chip: the
+ * streaming engine is dead and nothing short of a port reset (what a physical replug does)
+ * restarts it. Performed in place because the USB driver's pre_reset/post_reset hooks keep
+ * this interface bound - without both hooks usb_reset_device() force-unbinds it, and the
+ * DRM shutdown runs synchronously inside the caller's work item; fl2000_stream_disable()
+ * then waits on the watchdog work item that is executing it (self-deadlock holding the USB
+ * device lock, freezing the machine with no panic/kdump, 2026-09-10).
+ *
+ * Keeping the interface bound is also what makes this invisible to userspace: the DRM
+ * device is never unregistered, the minor does not change, and the compositor keeps the
+ * output it already had. That is the whole difference between a stall that recovers by
+ * itself and one that leaves the display black until logout.
+ *
+ * Returns 0 if the reset went through and streaming was restarted.
+ */
+static int fl2000_stream_reset_device(struct fl2000_stream *stream)
+{
+	struct usb_device *usb_dev = stream->usb_dev;
+	unsigned long flags;
+	int ret;
+
+	/* Park the transmit worker first: it must not submit URBs across the reset */
+	stream->enabled = false;
+	up(&stream->work_sem);
+	drain_workqueue(stream->work_queue);
+
+	ret = usb_lock_device_for_reset(usb_dev, NULL);
+	if (ret < 0) {
+		dev_err(&usb_dev->dev, "Cannot lock device for reset (%d)", ret);
+		goto failed;
+	}
+
+	ret = usb_reset_device(usb_dev);
+	if (ret)
+		dev_err(&usb_dev->dev, "USB device reset failed (%d)", ret);
+	usb_unlock_device(usb_dev);
+
+	if (ret)
+		goto failed;
+
+	/* post_reset() already reprogrammed the chip and restarted the aborted
+	 * interrupt URB. Drop any giveback straggler the reset left anchored,
+	 * then restart the streaming session.
+	 */
+	if (!usb_wait_anchor_empty_timeout(&stream->anchor, 1000)) {
+		usb_poison_anchored_urbs(&stream->anchor);
+		usb_scuttle_anchored_urbs(&stream->anchor);
+	}
+	init_usb_anchor(&stream->anchor);
+
+	/* The chunks that were on the wire are gone with the reset: the chip was
+	 * reprogrammed from scratch, so a frame that was half sent must not be
+	 * finished. Put every frame back in the render list with its chunk
+	 * counters cleared, and zero the in-flight counter - the poisoned URBs
+	 * never complete, so nothing else would ever decrement it and the
+	 * throttle would wedge the stream for good.
+	 */
+	spin_lock_irqsave(&stream->list_lock, flags);
+	while (!list_empty(&stream->wait_list)) {
+		struct fl2000_stream_buf *sb;
+
+		sb = list_first_entry(&stream->wait_list, struct fl2000_stream_buf,
+				     list);
+		list_del(&sb->list);
+		sb->chunk_next = 0;
+		sb->chunk_done = 0;
+		list_add_tail(&sb->list, &stream->render_list);
+	}
+	spin_unlock_irqrestore(&stream->list_lock, flags);
+
+	stream->cur_buf = NULL;
+	atomic_set(&stream->chunks_inflight, 0);
+
+	sema_init(&stream->work_sem, 0);
+	stream->enabled = true;
+	stream->last_completion = jiffies;
+	stream->stall_recoveries = 0;
+	stream->gave_up = false;
+	stream->last_urb_status = 0;
+	stream->completion_count = 0;
+	stream->error_count = 0;
+	queue_work(stream->work_queue, &stream->work);
+	for (int i = 0; i < FL2000_MAX_INFLIGHT; i++)
+		up(&stream->work_sem);
+
+	/* Closing line of the whole recovery. Without it "reprogramming chip mode" was the
+	 * last thing dmesg ever showed, which made a successful reset and a reset that left
+	 * the chip dark indistinguishable after the fact (incident 2026-10-16 09:33).
+	 */
+	dev_err(&usb_dev->dev,
+		"USB device reset done, stream re-enabled and %d URBs queued: if the monitor stays dark the chip did not answer the reprogram",
+		FL2000_MAX_INFLIGHT);
+
+	return 0;
+
+failed:
+	/* Hand the worker and the watchdog back rather than leaving enabled cleared,
+	 * which would silence both for the rest of the session with nothing in dmesg to
+	 * say why. The stream is still stalled, so the next tick retries and the
+	 * ladder eventually reaches the give-up log line
+	 */
+	stream->enabled = true;
+	up(&stream->work_sem);
+
+	return ret;
 }
 
 /* Runs on its own workqueue: the transmit worker parks inside its work function while
@@ -436,12 +696,36 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 	struct fl2000_stream *stream =
 		container_of(work, struct fl2000_stream, watchdog_work.work);
 	unsigned int inflight = 0;
+	unsigned int inflight_chunks = 0;
 	unsigned long flags;
 	struct fl2000_stream_buf *tmp;
 	long stalled_ms;
 
-	if (!stream->enabled)
+	/* The watchdog was cancelled: the stream is being torn down (or was re-enabled
+	 * and re-armed elsewhere). Do not re-arm here - a delayed work that re-arms
+	 * itself from inside its own run survives cancel_delayed_work_sync(), so a
+	 * cancelled watchdog that re-armed would tick forever on a dead stream.
+	 */
+	if (!stream->watchdog_armed) {
+		dev_info(&stream->usb_dev->dev,
+			"stall watchdog tick after cancellation, not re-arming");
 		return;
+	}
+
+	/* A tick that lands while the stream is disabled must not be the last one. Returning
+	 * here unarmed killed the recovery ladder for the rest of the session, silently:
+	 * fl2000_drm_pre_reset() clears 'enabled' through fl2000_stream_disable() on every
+	 * device-reset rung, and a tick in that window left the chip dark with no ladder, no
+	 * give-up line and no watchdog thread left in /proc to notice (incident 2026-10-16
+	 * 09:33: rung 4 ran, "reprogramming chip mode" was the last line the driver ever
+	 * printed, the transmit worker parked in down_interruptible for the rest of the day
+	 * and only a physical replug brought the monitor back).
+	 */
+	if (!stream->enabled) {
+		dev_warn_ratelimited(&stream->usb_dev->dev,
+			"watchdog tick with the stream disabled, re-arming");
+		goto rearm;
+	}
 
 	if (!time_after(jiffies, stream->last_completion + FL2000_STALL_TIMEOUT)) {
 		if (stream->stall_recoveries) {
@@ -461,6 +745,11 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		inflight++;
 	spin_unlock_irqrestore(&stream->list_lock, flags);
 
+	/* How many chunks are actually on the wire. With the frame split, this
+	 * is the number that says how much data the controller is holding for us.
+	 */
+	inflight_chunks = atomic_read(&stream->chunks_inflight);
+
 	if (stream->gave_up)
 		goto rearm;
 
@@ -468,17 +757,37 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 
 	if (stream->stall_recoveries <= FL2000_STALL_SOFT_TRIES) {
 		struct urb *stuck;
+		int status_ret;
 
 		dev_err(&stream->usb_dev->dev,
-			"stream stall: no URB completion for %ld ms (%u URBs in flight), soft recovery %u (last status %d, %u completions, %u errors)",
-			stalled_ms, inflight, stream->stall_recoveries, stream->last_urb_status,
+			"stream stall: no URB completion for %ld ms (%u frames, %u chunks in flight), soft recovery %u (last status %d, %u completions, %u errors)",
+			stalled_ms, inflight, inflight_chunks, stream->stall_recoveries, stream->last_urb_status,
 			stream->completion_count, stream->error_count);
 
 		/* Snapshot the chip's own status register: control transfers still work during
 		 * this wedge, so this is the chip's view of the dead output - the evidence every
 		 * previous occurrence never captured
 		 */
-		fl2000_log_vga_status(stream->usb_dev);
+		status_ret = fl2000_log_vga_status(stream->usb_dev);
+
+		/* ...unless they do not. A control transfer failing while the bulk
+		 * endpoint is already dead means the port or the chip is failing, not that
+		 * the endpoint is starved, so unlinking URBs and resetting the endpoint
+		 * below can only fail - and paying a watchdog tick per rung to find that
+		 * out is fatal, because the chip drops off the bus in the meantime. When it
+		 * does, the device re-enumerates on a different DRM minor and the display
+		 * stays black until the session restarts. Take the in-place reset now,
+		 * same work item: pre_reset/post_reset keep the interface bound, so the
+		 * compositor never sees the device leave.
+		 */
+		if (status_ret) {
+			dev_err(&stream->usb_dev->dev,
+				"stall with a failing VGA status read (%d), escalating straight to USB device reset recovery",
+				status_ret);
+
+			fl2000_stream_reset_device(stream);
+			goto rearm;
+		}
 
 		/* Ask the HCD to cancel the stuck URBs. Never poison/kill: both block
 		 * until the HCD gives every URB back, which never happens on a wedged
@@ -511,8 +820,6 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		up(&stream->work_sem);
 	} else if (stream->stall_recoveries <=
 		   FL2000_STALL_SOFT_TRIES + FL2000_STALL_EP_TRIES + FL2000_STALL_RESET_TRIES) {
-		int ret;
-
 		dev_err(&stream->usb_dev->dev,
 			"stream stall persists, USB device reset recovery %u",
 			stream->stall_recoveries);
@@ -520,56 +827,10 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 		/* The distinguishing signature: control transfers still complete (chip
 		 * app-reset succeeds) while bulk completions never resume. The chip's
 		 * streaming engine is wedged and only a port reset - exactly what a
-		 * physical replug does - revives it. Do that in software.
-		 *
-		 * Park the transmit worker first: it must not submit URBs across the
-		 * reset. The reset itself is performed in place: the USB driver's
-		 * pre_reset/post_reset hooks keep this interface bound, and post_reset()
-		 * reprograms the chip and restarts the aborted interrupt URB (the session
-		 * is re-kicked below). Without both hooks usb_reset_device() force-unbinds
-		 * the interface, and its DRM shutdown runs synchronously inside this very
-		 * work item - fl2000_stream_disable() then waits on the watchdog work item
-		 * that is executing it (self-deadlock holding the USB device lock),
-		 * freezing the machine with no panic/kdump (2026-09-10).
+		 * physical replug does - revives it. Do that in software, in place, so the
+		 * interface stays bound and the compositor never sees the device leave.
 		 */
-		stream->enabled = false;
-		up(&stream->work_sem);
-		drain_workqueue(stream->work_queue);
-
-		ret = usb_lock_device_for_reset(stream->usb_dev, NULL);
-		if (ret >= 0) {
-			ret = usb_reset_device(stream->usb_dev);
-			if (ret)
-				dev_err(&stream->usb_dev->dev, "USB device reset failed (%d)", ret);
-			usb_unlock_device(stream->usb_dev);
-		} else {
-			dev_err(&stream->usb_dev->dev, "Cannot lock device for reset (%d)", ret);
-		}
-
-		if (ret)
-			goto rearm;
-
-		/* post_reset() already reprogrammed the chip and restarted the aborted
-		 * interrupt URB. Drop any giveback straggler the reset left anchored,
-		 * then restart the streaming session.
-		 */
-		if (!usb_wait_anchor_empty_timeout(&stream->anchor, 1000)) {
-			usb_poison_anchored_urbs(&stream->anchor);
-			usb_scuttle_anchored_urbs(&stream->anchor);
-		}
-		init_usb_anchor(&stream->anchor);
-
-		sema_init(&stream->work_sem, 0);
-		stream->enabled = true;
-		stream->last_completion = jiffies;
-		stream->stall_recoveries = 0;
-		stream->gave_up = false;
-		stream->last_urb_status = 0;
-		stream->completion_count = 0;
-		stream->error_count = 0;
-		queue_work(stream->work_queue, &stream->work);
-		for (int i = 0; i < FL2000_MAX_INFLIGHT; i++)
-			up(&stream->work_sem);
+		fl2000_stream_reset_device(stream);
 	} else {
 		stream->gave_up = true;
 		dev_err(&stream->usb_dev->dev,
@@ -578,7 +839,45 @@ static void fl2000_stream_watchdog(struct work_struct *work)
 	}
 
 rearm:
-	queue_delayed_work(stream->watchdog_wq, &stream->watchdog_work, FL2000_WATCHDOG_PERIOD);
+	/* mod_delayed_work(), NOT queue_delayed_work().
+	 *
+	 * Re-arming a delayed work from inside its own callback is exactly the case
+	 * queue_delayed_work() cannot serve: the timer is detached while its callback
+	 * runs, so the internal timer_delete_sync() fails and the re-arm is silently
+	 * dropped. The symptom was a watchdog that ran a few ticks and then vanished
+	 * - its workqueue worker thread came and went (observed at 2026-10-28
+	 * 16:07, present; 16:08, gone; 16:25, gone again; 16:26, back), with not a
+	 * single line in dmesg, because the watchdog logs nothing when the stream is
+	 * healthy.
+	 *
+	 * mod_delayed_work() is the API for this: it re-arms the timer of a work
+	 * that is pending or running, from inside the callback.
+	 *
+	 * Its return value is the opposite of what it looks like: mod_delayed_work()
+	 * returns FALSE when the work was IDLE (which is the normal case here - the
+	 * work was consumed by the tick that just ran, so this call queues it fresh,
+	 * i.e. SUCCESS) and TRUE when it was pending and only had its timer moved.
+	 * So only the TRUE case needs a complaint.
+	 */
+	if (mod_delayed_work(stream->watchdog_wq, &stream->watchdog_work,
+			     FL2000_WATCHDOG_PERIOD)) {
+		dev_warn_ratelimited(&stream->usb_dev->dev,
+			"stall watchdog re-armed while still pending");
+	}
+
+	/* Heartbeat. A healthy watchdog used to be completely invisible: no log, no
+	 * thread you could count on, no way to tell "running" from "dead". Once a
+	 * minute, say so - and say which thread is doing the ticking, because the
+	 * workqueue worker for this pool is not the one you would expect (see
+	 * NOTES.md, session 12: no worker named fl2000_stall ever showed up).
+	 */
+	stream->watchdog_ticks++;
+	if (!(stream->watchdog_ticks % 60)) {
+		dev_info(&stream->usb_dev->dev,
+			"stall watchdog alive: %u ticks, %u completions, %u errors (tid %d, %s)",
+			stream->watchdog_ticks, stream->completion_count,
+			stream->error_count, task_pid_nr(current), current->comm);
+	}
 }
 
 static void fl2000_xrgb888_to_rgb888_line(u8 *dbuf, u32 *sbuf, u32 pixels)
@@ -724,6 +1023,26 @@ int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_p
 
 	stream->buf_size = size;
 
+	/* Say how the frame was split: with chunking on, one frame is several
+	 * bulk transfers, and that is what the Bluetooth interference story is
+	 * about (see FL2000_CHUNK_BYTES).
+	 */
+	{
+		struct fl2000_stream_buf *sb = NULL;
+
+		spin_lock_irqsave(&stream->list_lock, flags);
+		if (!list_empty(&stream->render_list))
+			sb = list_first_entry(&stream->render_list,
+					      struct fl2000_stream_buf, list);
+		spin_unlock_irqrestore(&stream->list_lock, flags);
+
+		if (sb) {
+			dev_info(&stream->usb_dev->dev,
+				"frame of %u bytes split into %u chunks of %u bytes",
+				size, sb->n_chunks, sb->chunk_bytes);
+		}
+	}
+
 	return 0;
 }
 
@@ -759,8 +1078,24 @@ int fl2000_stream_enable(struct fl2000_stream *stream)
 	for (int i = 0; i < FL2000_MAX_INFLIGHT; i++)
 		up(&stream->work_sem);
 
-	/* Arm the stall watchdog for the whole streaming session */
-	queue_delayed_work(stream->watchdog_wq, &stream->watchdog_work, FL2000_WATCHDOG_PERIOD);
+	/* Arm the stall watchdog for the whole streaming session.
+	 *
+	 * queue_delayed_work() returns false if the work was already pending, which
+	 * would silently skip the arming; log it.
+	 */
+	stream->watchdog_armed = true;
+	stream->watchdog_ticks = 0;
+	stream->cur_buf = NULL;
+	atomic_set(&stream->chunks_inflight, 0);
+	if (!queue_delayed_work(stream->watchdog_wq, &stream->watchdog_work,
+				FL2000_WATCHDOG_PERIOD)) {
+		dev_err(&stream->usb_dev->dev,
+			"stall watchdog was already pending when arming - the display will not self-heal");
+	}
+
+	dev_info(&stream->usb_dev->dev,
+		"stream enabled: stall watchdog armed (tick every %lu ms)",
+		(unsigned long)FL2000_WATCHDOG_PERIOD);
 
 	return 0;
 }
@@ -777,10 +1112,17 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 
 	stream->enabled = false;
 
+	/* The frame being chunked out is gone: drop the pointer so the worker
+	 * cannot touch a buffer that the mode set is about to free.
+	 */
+	stream->cur_buf = NULL;
+
 	/* Stop the watchdog first: it must not attempt recovery against a stream that is
 	 * being torn down (its 'enabled' check races a running iteration)
 	 */
 	fl2000_watchdog_cancel(stream);
+
+	dev_info(&stream->usb_dev->dev, "stream disabled");
 
 	/* Unblock a worker parked on the semaphore so drain can complete; the worker checks
 	 * 'enabled' on wake and exits
@@ -841,6 +1183,25 @@ struct fl2000_stream *fl2000_stream_create(struct usb_device *usb_dev, struct dr
 		return ERR_PTR(-ENOMEM);
 	}
 	devres_add(&usb_dev->dev, stream);
+
+	/* devres_alloc() hands back kmalloc() memory - NOT zeroed.
+	 *
+	 * INIT_WORK() clears the work flags, so the plain work item was fine, but
+	 * INIT_DELAYED_WORK() only fills the timer's callback and flags: everything
+	 * else the timer owns (including its lock) stays whatever was lying in that
+	 * slab. A delayed work armed on garbage memory silently never fires.
+	 *
+	 * That is precisely what happened, in every session: the stall watchdog was
+	 * armed - the log said "stream enabled: stall watchdog armed" - and never ran
+	 * a single tick. No fl2000_stall worker thread ever existed, the recovery
+	 * ladder that revives a wedged chip never executed, and the display stayed
+	 * black until a physical replug (2026-10-16 09:33, 2026-10-28 12:06).
+	 *
+	 * The kernel's contract for INIT_WORK/INIT_DELAYED_WORK is "zero
+	 * initialization followed by setting the function pointer", and
+	 * timer_setup() (which does memset) is the alternative. Zero the struct.
+	 */
+	memset(stream, 0, sizeof(*stream));
 
 	INIT_WORK(&stream->work, &fl2000_stream_work);
 	INIT_DELAYED_WORK(&stream->watchdog_work, &fl2000_stream_watchdog);
