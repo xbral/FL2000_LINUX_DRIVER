@@ -1420,3 +1420,520 @@ Where to go from here (no driver fix proposed):
 Verification status: display recovered after the relogin (modeset at 08:01:08);
 the machine did NOT freeze and there was no fault in fl2000 - this incident is
 entirely outside the driver's reach.
+
+## Device-reset rung completes, then the watchdog never runs again (2026-10-16, session 11)
+
+User report: "o monitor parou de funcionar novamente e não voltou, ele ainda
+está conectado via usb porém com a tela preta". Boot began Oct 13 07:50, module
+`1E50DE90CD5049885E78440`, same USB path as every other occurrence (`4-1`).
+
+Timeline (Oct 16). Unlike session 10, the host-side ladder DID run, and unlike
+every occurrence before it, the device stayed enumerated on the same minor:
+
+    09:02:04  Mode configured: 1920x1080@60 RGB565      <- last good modeset
+    09:33:26  stream stall: no URB completion for 591 ms (2 URBs in flight),
+              soft recovery 1 (last status 0, 112877 completions, 0 errors)
+    09:33:26  VGA status 0x33fffee3: connected 1 ... pll_up 1 dac_up 1
+    09:33:26  fl2000_urb_status: 208 callbacks suppressed
+    09:33:26  Nonzero urb status, -71                    x73  (EPROTO)
+    09:33:27  stream stall: ... soft recovery 2 (last status -71, 73 errors)
+    09:33:28  stream stall persists, endpoint reset recovery 3
+    09:33:29  stream stall persists, USB device reset recovery 4
+    09:33:29  reset SuperSpeed USB device number 3 using xhci_hcd
+    09:33:29  Stopping interrupts
+    09:33:29  USB device reset: reprogramming chip mode
+              <-- LAST LINE THE DRIVER EVER PRINTED. Silent for the next 1h45.
+
+112877 completions since 09:02 is 60 fps exactly: the stream was healthy and the
+chip stopped mid-frame. Same signature as every previous occurrence (bulk
+completions stop, control transfers keep answering, `-71`/EPROTO floods the
+endpoint), same escalation path - what is new is what happened *after* rung 4.
+
+### What the reset left behind
+
+Measured while the monitor was black:
+
+- **No re-enumeration.** Still `Bus 004 Device 003`, `bConfigurationValue=1`,
+  5000 Mb/s. The in-place `pre_reset`/`post_reset` design held: same DRM minor
+  (`card0`), `card0-VGA-1` never left `/sys/class/drm`, connector still reads
+  `connected` + `enabled`. Mutter therefore never noticed and never re-modeset.
+- **The transmit worker is parked.** `/proc/2459297/stack` reads
+  `fl2000_stream_work+0x75`, and `+0x75` is the instruction right after the
+  `down_interruptible` call (confirmed in the disassembly of the loaded `.ko`).
+  Stable across samples: no URB has completed since 09:33, so no pixel leaves.
+- **The stall watchdog is gone.** The driver creates three workqueues;
+  `fl2000_stream` and `fl2000_interrupt` both have live kworker threads,
+  `fl2000_stall` has none. The ladder that revived the display three times in
+  this boot cannot run again.
+- **Nothing is wedged.** Every `/proc/*/task/*/stack` on the machine was
+  scanned: no thread anywhere inside fl2000/usb/xhci code except the parked
+  worker. This is a silent dead state, not a deadlock.
+- **No userspace path back.** Mutter's `GetCurrentState` lists only `HDMI-1`
+  and `eDP-1` - it lost the VGA output after the 00:34 re-enumeration
+  (`drmModeRmFB: No such device`, `Page flip failed`). The CRTC is held by
+  fbcon instead (`plane[35] fb=40 allocated by [fbcon]`, XR24). `xrandr` cannot
+  see the output, `card0-VGA-1/dpms` is `-r--r--r--` (no DPMS handler
+  registered), and writing 6.2 MB to `/dev/fb1` produced no log line, no worker
+  CPU and no watchdog. A physical replug was the only recovery.
+
+Note: ftrace is non-functional on this machine (0 entries from the `function`
+tracer with no filter), so all of the above comes from `/proc` + disassembly.
+
+### Two defects, both about the driver being unable to say what it is doing
+
+**1. `fl2000_stream_watchdog()` returned unarmed (fl2000_streaming.c).** The
+first statement was
+
+```c
+if (!stream->enabled)
+        return;
+```
+
+- no log, no re-arm. One tick landing in a window where `enabled` is false kills
+the recovery ladder for the rest of the session, permanently and silently. That
+window exists on every rung-4 run: `fl2000_drm_pre_reset()` calls
+`fl2000_stream_disable()`, which clears `enabled` (fl2000_streaming.c:834), and
+the only place that sets it back is the tail of
+`fl2000_stream_reset_device()`, i.e. *after* `usb_reset_device()` returns. A
+tick anywhere in there ends the watchdog. The observable result is exactly what
+was found: no `fl2000_stall` thread, no further logs, black screen, no give-up
+line.
+
+Fixed to `goto rearm` with a `dev_warn_ratelimited()`. Safe against teardown:
+`fl2000_watchdog_cancel()` does `cancel_delayed_work_sync()` before
+`destroy_workqueue()`, that call waits for pending *and* running items, and a
+delayed work can only re-arm from inside a run - so the re-arm either loses the
+race to the cancel or is caught by it.
+
+**2. `fl2000_stream_reprogram()` was unobservable.** It printed one `dev_err()`
+*before* touching any register, chained every step through `if (!ret)`, and
+`fl2000_drm_post_reset()` discarded the return value entirely. A run that died
+on the very first `usb_set_interface()` was indistinguishable in dmesg from one
+that programmed the chip perfectly. Since "reprogramming chip mode" was the
+last line the driver ever printed, this incident cannot even be attributed
+today: the chip may have been dead, or the reprogram may have failed on the
+first control transfer after the reset.
+
+Fixed: each step is named, failures log the step and the errno, success logs the
+replayed geometry, and `fl2000_stream_reset_device()` logs a closing line when
+the stream is re-armed. A future occurrence will say which register write did
+not answer, and whether the recovery completed.
+
+### Status
+
+Installed as `fl2000_drm/1.0.5` (srcversion `528025688BCB2607B3150BB`,
+previously `1E50DE90CD5049885E78440`), initramfs refreshed. **Not yet loaded**:
+the running module needs a reboot, since `rmmod` still fails on the per-plug
+reference leak. Recovery of the current black screen is a physical replug.
+
+Not fixed, and not fixed by this change: the underlying wedge is still the chip
+losing its streaming engine under bulk load, and the session-10 case (chip
+self-resets off the bus before any rung runs) is still outside the driver's
+reach.
+
+## Session 12 (2026-10-28): dongle drops off the bus again, and the Bluetooth mouse
+
+Two complaints on the same day: the USB monitor went dark again, and the
+Bluetooth mouse stutters. Boot 09:49, module 1.0.5 (`528025688BCB2607B3150BB`),
+dongle on `4-1` (USB3), Bluetooth dongle `8087:0026` (AX201) on `3-10` - **both on
+the same xHCI controller `0000:00:14.0`**, fl2000 on the USB3 bus, BT on the
+USB2 companion bus.
+
+### The monitor
+
+    09:49:30  [drm] Initialized fl2000_drm on minor 1
+    10:19:09  USB disconnect, device number 2
+    10:19:10  new SuperSpeed USB device number 3
+    11:23:15  Mode requested / Mode configured 1920x1080@60 RGB565
+    11:23:36  USB disconnect, device number 3          <- device-initiated
+    11:23:39  new SuperSpeed USB device number 4
+    11:23:42  Mode requested / Mode configured
+    11:24:46  Mode requested / Mode configured
+
+**No `stream stall` line at all in this boot.** The ladder never ran: the chip
+simply left the bus (the session-10 pattern, out of the driver's reach). And
+after the re-enumeration the stream was dead again:
+
+- transmit worker parked in `down_interruptible` (`fl2000_stream_work+0x75`,
+  confirmed in the disassembly), 0 CPU over 30 s
+- **the `fl2000_stall` watchdog worker did not exist**, even with the 1.0.5
+  re-arm fix. Neither `kworker/R-fl2000_stall` nor `kworker/u32:N+fl2000_stall`.
+- `card0-VGA-1` still `connected`, CRTC still `active=1`, fb owned by
+  gnome-shell. Nothing in userspace noticed.
+
+So the 1.0.5 fix did not fix it, because the watchdog was never *armed* in that
+session - not "armed and died". That is not distinguishable from the outside
+without instrumentation, which is what 1.0.6 adds.
+
+Mutter also carries a stale key: it knows the monitor as **VGA-2** (from
+`~/.config/monitors.xml`, which has accumulated VGA-1..VGA-5 entries from five
+different sessions) while the kernel connector is **VGA-1** (the driver pins the
+name at bind time). Mutter therefore applies a config whose connector key does
+not exist, and the output stays black. The XML should be pruned.
+
+### 1.0.6 changes
+
+- **Watchdog lifecycle is now observable**: `fl2000_display_enable/disable`,
+  `fl2000_stream_enable/disable`, the arm and the cancel all log. "The watchdog
+  never ran" and "the watchdog ran and died" are now different log lines.
+- **`watchdog_armed` flag** replaces the overloaded `enabled` test in the
+  watchdog tick. 1.0.5 re-armed on `!enabled`, which cannot distinguish
+  "transiently disabled by pre_reset" from "torn down", and a delayed work that
+  re-arms itself from inside its own run survives `cancel_delayed_work_sync()`
+  - so 1.0.5 could leave a disabled watchdog ticking forever, and could not
+  tell a real teardown from a transient one.
+- **Halved the driver's constant control traffic**: `fl2000_check_interrupt()`
+  ran `regmap_write_bits(VGA_STATUS_REG, mask, ...)` on every interrupt poll
+  even with `mask == 0`, i.e. a full USB control transfer that changes
+  nothing, 125 times a second, forever. Now skipped when `mask == 0`. This is
+  the only always-on USB cost the driver has, and it lands on the same xHCI as
+  the Bluetooth dongle.
+
+Installed as `fl2000_drm/1.0.6` (srcversion `71D092D5598D03C14DE9D27`);
+needs a reboot to load.
+
+### A/B protocol for the mouse (scripts/bt_stutter_ab.py)
+
+Measuring the input layer alone is worthless here: the timestamp of an
+`input_event` is when it reached the input core, so a period in which the user
+simply stopped moving the mouse looks exactly like a stutter. The tool instead
+captures btmon and the input device **simultaneously** and aligns them:
+
+- a big delay between an HCI packet and its input event = the host delayed it
+- a hole in the HCI timeline = the link delayed it
+- a hole in the HCI timeline **followed by a burst** (several packets less than
+  5 ms apart) = the reports were held somewhere and released all at once -
+  this is the "grudinho" the user feels, and it is the one metric that does
+  not depend on how much the hand moved
+
+Baseline before the replug (driver idle, 1.0.5, mouse moved continuously):
+
+    carga do fl2000: 0.000 s de CPU   (watchdog AUSENTE)
+    HCI: 2201 pacotes (55.2/s)   input: 1970 eventos (56.8/s)
+    buracos no HCI > 100ms: 34
+      deles seguidos de rajada: 0
+      maior buraco no HCI: 1800 ms
+    atraso HCI -> input: p50=10.9 p90=12.2 p99=100.9 max=325  (>100ms: 20)
+    gaps do input layer: 20-500ms=133  >500ms=6
+
+To be run after the reboot + replug, with the dongle actually streaming:
+
+    sudo scripts/bt_stutter_ab.py 40 "DEPOIS (fl2000 transmitindo, 1.0.6)"
+
+### monitors.xml
+
+Mutter keys a monitor by (connector, vendor, product, serial). The file had
+accumulated one `<configuration>` per session - VGA-1 through VGA-5, from five
+different sessions where the kernel had named the connector differently before
+the pin was added. Mutter therefore applied a configuration whose connector
+key did not exist and the output stayed black. Rewritten with a single
+configuration and the connector name the driver actually pins
+(`VGA-1`), matching the kernel's `/sys/class/drm/card0-VGA-1`. Backup at
+`~/.config/monitors.xml.bak-2026-10-28`.
+
+### ROOT CAUSE of the dead stall watchdog: devres_alloc() is not zeroed
+
+Found on 2026-10-28, after the 1.0.6 instrumentation showed the watchdog being
+armed and never running.
+
+    12:06:44  display enable: arming the stream
+    12:06:44  stream enabled: stall watchdog armed (tick every 1000 ms)
+    ... and no fl2000_stall worker thread, ever, in any session
+
+`fl2000_stream_create()` does:
+
+```c
+	stream = devres_alloc(&fl2000_stream_release, sizeof(*stream), GFP_KERNEL);
+	...
+	INIT_WORK(&stream->work, &fl2000_stream_work);
+	INIT_DELAYED_WORK(&stream->watchdog_work, &fl2000_stream_watchdog);
+```
+
+`devres_alloc()` is `kmalloc()` - **the memory is not zeroed**. `INIT_WORK()`
+sets `work->flags = 0`, so the plain work item was fine. But
+`INIT_DELAYED_WORK()` expands to `__TIMER_INITIALIZER()`, which fills only the
+timer's callback, flags and entry pointer - **it never touches the rest of the
+timer, including its lock**. `timer_setup()` (the alternative) does
+`memset(timer, 0, sizeof(*timer))` inside `timer_init_key()`; the static
+initializer has no such memset and the kernel's documented contract for
+`INIT_WORK`/`INIT_DELAYED_WORK` is "zero initialization followed by setting the
+function pointer".
+
+A `delayed_work` armed on garbage memory silently never fires. Which is
+exactly what was observed: the watchdog was armed, logged, and never ran a
+single tick - so the recovery ladder that revives a wedged chip never executed,
+in any session, and the display stayed black until a physical replug.
+
+Fixed in 1.0.7 by `memset(stream, 0, sizeof(*stream))` right after the
+allocation, and the same for `fl2000_intr_create()`'s `struct fl2000_intr`.
+
+This is the defect behind the whole "monitor goes dark and never comes back"
+family of incidents: the chip wedges, the *host* side ladder that was supposed
+to notice and fix it never ran, and the only thing that ever brought the
+display back was the physical replug.
+
+### Second defect: the watchdog re-armed itself with the wrong API
+
+With 1.0.7 the watchdog finally existed (`kworker/u32:0-fl2000_stall`) - and
+then it vanished again, with not a single line in dmesg:
+
+    16:07  verify_after_reboot: 1 thread(s): kworker/u32:0-fl2000_stall
+    16:08  bt_stutter_ab:         watchdog AUSENTE
+    16:25  ps:                    fl2000_stall=0
+    16:26  ps:                    fl2000_stall=1   (novo tid)
+
+The workqueue worker came and went, and nothing was logged, because a healthy
+watchdog logs nothing at all - the ladder only speaks when it has something to
+recover.
+
+The cause is the re-arm at the end of the watchdog function:
+
+```c
+rearm:
+	queue_delayed_work(stream->watchdog_wq, &stream->watchdog_work, FL2000_WATCHDOG_PERIOD);
+```
+
+Re-arming a delayed work **from inside its own callback** is exactly the case
+`queue_delayed_work()` cannot serve: the timer is detached while its callback
+runs, so the internal `timer_delete_sync()` fails and the re-arm is silently
+dropped. `mod_delayed_work()` is the API for that case.
+
+Fixed in 1.0.8: `mod_delayed_work()` at the re-arm, the return value of both
+the arm and the re-arm logged, and a heartbeat every 60 ticks
+(`stall watchdog alive: N ticks, M completions, K errors`) so a healthy
+watchdog stops being invisible.
+
+Note on the return value: `mod_delayed_work()` returns **false when the work
+was idle** - which is the normal case here, because the tick that just ran
+consumed the work, so the call queues it fresh, i.e. success. Reading it the
+other way round produced a "failed to re-arm itself" line every second. The
+check is now the right way round (1.0.9).
+
+### The Bluetooth mouse: the driver WAS the cause after all - CORRECTED, IT WAS NOT
+
+The A/B was done the only way that controls for the confound: same session,
+same window, the dongle's output switched off and on between the two
+measurements, so the user's hand is the control and the dongle is the only
+variable. The measurement aligns the btmon timeline with the input-event
+timeline by the offset that maximises the number of input events landing on
+an HCI packet - a metric that does not depend on how much the hand moved.
+
+    A  fl2000 TRANSMITINDO (1.85 s de CPU na janela)
+       57,0% dos eventos de input casam com um pacote HCI (+/-5 ms)
+       atraso |evento - pacote|: p50=1,9  p90=2621  p99=3532  max=3599 ms
+       37,9% dos eventos a mais de 100 ms do pacote HCI
+       29,3% a mais de 500 ms - ate 3,6 SEGUNDOS de atraso
+
+    B  fl2000 OCIOSO (0,000 s de CPU na janela)
+       100,0% dos eventos de input casam com um pacote HCI (+/-5 ms)
+       atraso |evento - pacote|: p50=0,0  p90=0,1  p99=0,2  max=4 ms
+       NENHUM evento a mais de 5 ms
+
+**THIS VERDICT WAS WRONG**, and the reason is the window densities: that "A"
+window had **16,9 eventos/s** and the "B" window had **160,7**. The metric
+needs a dense event stream - with few events, the offset that "matches" an
+event to an HCI packet is ambiguous and the delay becomes noise.
+
+The proof came from the run of 2026-10-28 17:05, where the **fl2000 idle**
+window - the control, dongle doing nothing - measured p50 = 2173 ms and 784
+late events per thousand, simply because that window had 19,8 eventos/s.
+
+With dense movement (~170 eventos/s in all three windows of the same run):
+
+    A1  chunks de 1 MB, transmitindo   p99= 13,9 ms   0,3 atrasados/1000
+    A2  1 URB por frame, transmitindo  p99= 13,2 ms   0,0 atrasados/1000
+    B   fl2000 ocioso                  p99= 13,9 ms   1,6 atrasados/1000
+
+**All three are clean.** The fl2000's streaming load does **not** degrade the
+Bluetooth link in steady state, and the chunking neither fixed nor broke
+anything measurable there. The tool now flags any window with fewer than 60
+eventos/s as not comparable.
+
+So the mouse stutter is **not** the fl2000's fault - which is what the
+measurements taken with the driver completely idle had already said:
+
+- Input layer (`/dev/input/event20`, the BT mouse): 88 gaps of 20-500 ms in
+  60 s, worst 416 ms.
+- HCI layer (`btmon`, 30 s): 2622 ACL RX packets, p50 interval 11.0 ms,
+  p99 22.9 ms, **max 169 ms**, 98.2 % of intervals below 15 ms.
+- Aligned HCI -> input: delivery delay p50 10 ms, p90 12 ms, p99 22.9 ms;
+  **5 events out of 3416** had more than 100 ms of host-side delay.
+- bluetoothd is not starved either - 0,14 ms of runqueue wait over 10 s.
+
+The host path (USB bulk -> btusb -> HCI -> BlueZ -> HIDP -> input core) adds
+essentially nothing: the delay visible at the input layer is the delay already
+present at the HCI socket.
+
+What the capture does show is the link cycling between modes, with the host
+only waking it every 30 seconds:
+
+    < HCI Command: Exit Sniff Mode
+    > HCI Event: Mode Change  Mode: Active (0x00)
+    > HCI Event: Mode Change  Mode: Sniff (0x02) Interval: 11,250 ms
+    > ACL Data RX                        <- 1,57 s de nada no meio
+
+The two `Exit Sniff Mode` commands are exactly 30,03 s apart - a periodic
+host task. In between, the mouse's report waits in the peripheral until the
+host polls the link. **That is the stutter, and it is a Bluetooth-side
+phenomenon**: the sniff policy of the AX201/MTK controller, the mouse's own
+firmware, or the RF environment.
+
+Things worth testing with dense movement, in this order:
+
+1. **USB autosuspend of the Bluetooth dongle.** `btusb` runs with
+   `enable_autosuspend=Y`; the AX201 controller going to sleep is a classic
+   source of multi-hundred-millisecond mouse stalls.
+   `echo on > /sys/bus/usb/devices/3-10/power/control`
+2. **2,4 GHz interference.** The laptop's WiFi is on 5 GHz (channel 132), but
+   the AX201 shares one antenna and one RF front end between WiFi and
+   Bluetooth, and the WiFi link is weak (-74 dBm, 21 % of packets
+   retransmitted). Heavy WiFi retransmission steals airtime from the
+   Bluetooth link.
+3. **The mouse's own RF and firmware.** A cheap Jieli mouse with an
+   internal antenna, next to a USB 3 dongle radiating.
+4. **The controller's link policy** - the sniff interval the AX201 negotiates
+   is visible in the capture (`Mode Change ... Sniff (0x02) Interval:
+   11,250 ms`).
+
+### The Bluetooth side, measured (scripts/bt_side_test.sh)
+
+    C1  baseline (autosuspend auto), fl2000 TRANSMITINDO a 5% de um core
+        2278 pacotes HCI (73,4/s) | 3115 eventos (101,8/s)
+        atraso p50=1,9  p90=5,8  p99=12,9  max=14 ms
+        NENHUM evento a mais de 100 ms
+
+The link is clean with the dongle streaming. The stutter did not reproduce
+after the reboot, which fits the hypothesis that it was a symptom of the
+degraded state the dongle was in during the previous session (chip
+half-configured, output toggled repeatedly, driver in a broken state) and
+not a steady-state property of the streaming load.
+
+The tool now refuses to compare a window with fewer than 60 eventos/s and
+says so explicitly - the sparse windows were the source of two wrong
+verdicts in this session.
+
+### 1.0.9
+
+- the `mod_delayed_work()` return value checked the right way round (no more
+  "failed to re-arm" spam)
+- the heartbeat now names the thread doing the ticking, to settle the
+  question of which workqueue worker runs the watchdog
+
+### 1.0.10 - the frame is split into chunks
+
+`fl2000_chunk_kb` (default 1024, 0 = one URB per frame) splits each frame
+into bulk transfers of that size. At 1080p60 RGB565 a frame is 4,15 MB, which
+went out as a single URB; now it goes out as 4 chunks of ~1 MB.
+
+**Result: it did NOT fix the Bluetooth stutter.** With dense mouse movement
+all three configurations measure identically clean (see the correction
+above). The chunking is kept because it is correct, it preserves the frame
+rate exactly (measured: 246 chunks/s = 61,5 frames/s, 0 errors) and it cuts
+the bulk the controller holds queued for us from 8,3 MB to 2 MB - good
+hygiene on a controller shared with a Bluetooth dongle. But it is not the
+answer to the mouse, and the notes above have been corrected accordingly.
+
+**What changed in the streaming path:**
+
+- `struct fl2000_stream_buf` grew a table of per-chunk scatterlists
+  (`chunk_sgt[]`), the chunk counters (`chunk_next`, `chunk_done`) and
+  `chunk_bytes`. The pages and the vmap are unchanged - the chunks are views
+  of the same buffer, built with `sg_alloc_table_from_pages()` per chunk, so
+  the byte stream the chip sees is identical to before.
+- The transmit worker sends one chunk at a time, keeping at most
+  `FL2000_MAX_INFLIGHT` **chunks** in flight (was: that many *frames*, i.e.
+  8,3 MB of queued bulk; now 2 MB). The throttle counts chunks, not frames.
+- The chunks of a frame go out in order - the frame stays in `stream->cur_buf`
+  until its last chunk is submitted - so the chip still receives whole frames
+  in sequence.
+- **Only the last chunk of a frame carries `URB_ZERO_PACKET`**: the ZLP is
+  what closes a frame for the chip, and one in the middle of a frame would be
+  read as the end of it.
+- The completion counts chunk completions. The buffer goes back to the render
+  list and the vblank fires only when the **last** chunk of a frame completes
+  - the vblank rate is unchanged (one per frame), which matters: firing it per
+  chunk would have made mutter render at 4x the rate.
+- The USB device reset path now puts the half-sent frames back in the render
+  list with their chunk counters cleared and zeroes the in-flight counter.
+  Without that, the poisoned URBs (which never complete) would leave the
+  counter stuck and the throttle would wedge the stream for good.
+
+**Honest expectation:** the burst is 4x shorter and the queued bulk is 4x
+smaller, but the byte rate is the same - 249 MB/s - and the chip's FIFO
+paces the host, so the wire traffic is roughly continuous either way. The
+interference with the Bluetooth dongle is therefore most likely dominated by
+the *byte rate*, not by the burst shape. If the measurement after this change
+shows no improvement, the effective fixes are the ones that cut bytes or cut
+the contention: lower the VGA mode, or put the Bluetooth dongle on the
+Thunderbolt controller (`0000:00:0d.0`), which shares nothing with the
+fl2000.
+
+`fl2000_chunk_kb=0` restores the old one-URB-per-frame behaviour, so the two
+can be compared without rebuilding.
+
+### The A/B protocol (scripts/bt_ab_full.sh)
+
+The interference is measured by running btmon and the input device
+**simultaneously** and aligning them. The alignment metric is the one that
+does not depend on how much the hand moved: the offset that maximises the
+number of input events landing on an HCI packet, and then the distribution of
+the distance between an event and its packet.
+
+    A  fl2000 TRANSMITINDO (1,85 s de CPU na janela)
+       57,0% dos eventos de input casam com um pacote HCI (+/-5 ms)
+       atraso |evento - pacote|: p50=1,9  p90=2621  p99=3532  max=3599 ms
+       546,8 eventos a mais de 100 ms por mil eventos
+
+    B  fl2000 OCIOSO (0,000 s de CPU na janela)
+       100,0% dos eventos de input casam com um pacote HCI (+/-5 ms)
+       atraso |evento - pacote|: p50=0,0  p90=0,1  p99=0,2  max=4 ms
+       0,0 eventos a mais de 100 ms por mil eventos
+
+All the big holes in the HCI timeline are innocent: every one of them has
+zero input events inside, i.e. the mouse simply was not moving. The stutter
+is in the *delivery delay*, not in the gaps.
+
+`scripts/bt_ab_full.sh` runs three windows in one go - chunks of 1 MB, one
+URB per frame (`chunk_kb=0`), and the dongle idle - changing `chunk_kb` and
+forcing a modeset in between (the toggle triggers "Mode configured", and the
+buffers with their per-chunk scatterlists are reallocated there, so the
+parameter takes effect without a rebuild). `scripts/bt_ab_compare.py` prints
+the comparison, normalising by the number of events so that windows with
+different hand movement stay comparable.
+
+Note on the watchdog check inside the A/B tool: the thread of the
+`fl2000_stall` workqueue never shows up in /proc (session 12), so the tool
+judges it by the driver's heartbeat instead.
+
+### scripts/fl2000_toggle.py
+
+`xrandr` cannot see the VGA output (it is not on the Xwayland screen) and the
+DRM `dpms` attribute is read-only (no DPMS handler is registered), so the only
+way to force `fl2000_display_disable()`/`enable()` - and with it a fresh
+watchdog arming - is Mutter's DisplayConfig D-Bus API. The script does that,
+re-packing the layout so Mutter's "logical monitors not adjacent" and "missing
+primary logical" checks pass.
+
+### scripts/verify_after_reboot.py
+
+One-shot check of everything the dmesg alone cannot answer: module srcversion
+installed vs. loaded, whether the `fl2000_stall` worker exists, whether the
+watchdog was armed/cancelled, whether the stream is alive, whether the
+recovery ladder ever had to run, and whether the kernel's connector name
+matches the one Mutter knows.
+
+Run it as the **user**, not as root: Mutter is only reachable through the
+user's session bus. The privileged bits (kernel journal, `/proc/<tid>/stack`)
+go through `sudo` from inside the script.
+
+Note on the stream check: the transmit worker parks in `down_interruptible()`
+between completions even on a healthy stream (it wakes 60 times a second at
+60 fps), so the stack does not distinguish "dead" from "alive". What
+distinguishes them is the watchdog: if it exists and has not logged a stall,
+frames are arriving. The worker's CPU consumption is reported alongside as a
+supporting number, not as the verdict.
+
+### scripts/bt_stutter_ab.py
+
+Captures btmon and the input device simultaneously and aligns them; see the
+A/B protocol section above.
